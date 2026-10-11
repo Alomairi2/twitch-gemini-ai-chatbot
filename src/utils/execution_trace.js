@@ -54,13 +54,10 @@ function makeSanitizer(redactions) {
 
         const result = {};
         for (const [childKey, child] of Object.entries(value)) {
-            if (childKey === 'inlineData' && child && typeof child === 'object') {
-                result[childKey] = {
-                    mimeType: sanitize(child.mimeType, 'mimeType', seen),
-                    data: typeof child.data === 'string'
-                        ? `[binary omitted: ${byteCountFromBase64(child.data).toLocaleString('en-US')} bytes, ${child.data.length.toLocaleString('en-US')} base64 chars]`
-                        : '[binary omitted]'
-                };
+            if (childKey === 'data' && ['image', 'audio', 'video', 'document'].includes(value.type)) {
+                result[childKey] = typeof child === 'string'
+                    ? `[binary omitted: ${byteCountFromBase64(child).toLocaleString('en-US')} bytes, ${child.length.toLocaleString('en-US')} base64 chars]`
+                    : '[binary omitted]';
                 continue;
             }
             result[childKey] = sanitize(child, childKey, seen);
@@ -101,74 +98,24 @@ function textBlock(lines, value, sanitize, indent = '  ') {
     }
 }
 
-function renderPart(lines, path, part, tools) {
-    const { redactText, sanitize } = tools;
-    if (!part || typeof part !== 'object') {
-        lines.push(`${path} unknown: ${json(part, sanitize)}`);
+function renderSteps(lines, steps, tools, prefix = 'steps') {
+    if (!Array.isArray(steps)) {
+        lines.push(`${prefix}: ${json(steps, tools.sanitize)}`);
         return;
     }
-
-    if (typeof part.text === 'string') {
-        const kind = part.thought === true ? 'thought' : 'text';
-        multiline(lines, `${path} ${kind}`, part.text, redactText);
-        if (part.thoughtSignature != null) {
-            lines.push(`${path} thoughtSignature: ${scalar(part.thoughtSignature, redactText)}`);
-        }
-        const remaining = Object.fromEntries(Object.entries(part).filter(
-            ([key]) => !['text', 'thought', 'thoughtSignature'].includes(key)
-        ));
-        if (Object.keys(remaining).length > 0) {
-            lines.push(`${path} metadata: ${json(remaining, sanitize)}`);
-        }
-        return;
-    }
-
-    const call = part.functionCall || part.function_call;
-    if (call) {
-        lines.push(`${path} functionCall ${redactText(call.name || '<unnamed>')}: ${json(call.args ?? {}, sanitize)}`);
-        if (part.thoughtSignature != null) {
-            lines.push(`${path} thoughtSignature: ${scalar(part.thoughtSignature, redactText)}`);
-        }
-        return;
-    }
-
-    const response = part.functionResponse || part.function_response;
-    if (response) {
-        lines.push(`${path} functionResponse ${redactText(response.name || '<unnamed>')}: ${json(response.response ?? {}, sanitize)}`);
-        return;
-    }
-
-    const inline = part.inlineData || part.inline_data;
-    if (inline) {
-        const length = typeof inline.data === 'string' ? inline.data.length : 0;
-        const bytes = typeof inline.data === 'string' ? byteCountFromBase64(inline.data) : 0;
-        lines.push(`${path} inlineData ${redactText(inline.mimeType || inline.mime_type || 'unknown')}: [binary omitted: ${bytes.toLocaleString('en-US')} bytes, ${length.toLocaleString('en-US')} base64 chars]`);
-        return;
-    }
-
-    lines.push(`${path} unknown: ${json(part, sanitize)}`);
-}
-
-function renderContents(lines, contents, tools, prefix = 'contents') {
-    if (!Array.isArray(contents)) {
-        lines.push(`${prefix}: ${json(contents, tools.sanitize)}`);
-        return;
-    }
-    contents.forEach((content, contentIndex) => {
-        const role = tools.redactText(content?.role || '<none>');
-        lines.push(`${prefix}[${contentIndex}] role=${role}`);
-        if (!Array.isArray(content?.parts)) {
-            lines.push(`${prefix}[${contentIndex}].parts: ${json(content?.parts, tools.sanitize)}`);
-            return;
-        }
-        content.parts.forEach((part, partIndex) => {
-            renderPart(lines, `${prefix}[${contentIndex}].parts[${partIndex}]`, part, tools);
-        });
-        const remaining = Object.fromEntries(Object.entries(content || {}).filter(
-            ([key]) => !['role', 'parts'].includes(key)
-        ));
-        if (Object.keys(remaining).length > 0) {
-            lines.push(`${prefix}[${contentIndex}] metadata: ${json(remaining, tools.sanitize)}`);
+    steps.forEach((step, index) => {
+        const path = `${prefix}[${index}]`;
+        lines.push(`${path} ${tools.redactText(step?.type || 'unknown')}`);
+        for (const [key, value] of Object.entries(step || {})) {
+            if (key === 'type') continue;
+            if (key === 'content' && Array.isArray(value)) {
+                value.forEach((part, partIndex) => {
+                    if (part.type === 'text') multiline(lines, `${path}.content[${partIndex}] text`, part.text, tools.redactText);
+                    else lines.push(`${path}.content[${partIndex}]: ${json(part, tools.sanitize)}`);
+                });
+            } else {
+                lines.push(`${path}.${key}: ${json(value, tools.sanitize)}`);
+            }
         }
     });
 }
@@ -228,7 +175,7 @@ function renderFunctionDeclaration(lines, declaration, declarationIndex, tools) 
         return;
     }
 
-    const schema = declaration.parametersJsonSchema || declaration.parameters;
+    const schema = declaration.parameters;
     const required = new Set(Array.isArray(schema?.required) ? schema.required : []);
     const properties = schema?.properties && typeof schema.properties === 'object'
         ? Object.entries(schema.properties)
@@ -244,7 +191,7 @@ function renderFunctionDeclaration(lines, declaration, declarationIndex, tools) 
     renderSchemaProperties(lines, schema, tools, '      ');
 
     const remaining = Object.fromEntries(Object.entries(declaration).filter(
-        ([key]) => !['name', 'description', 'parameters', 'parametersJsonSchema'].includes(key)
+        ([key]) => !['type', 'name', 'description', 'parameters'].includes(key)
     ));
     if (Object.keys(remaining).length > 0) {
         lines.push(`      metadata: ${json(remaining, tools.sanitize)}`);
@@ -264,23 +211,8 @@ function renderTools(lines, configuredTools, tools) {
             return;
         }
 
-        const declarations = tool.functionDeclarations;
-        if (Array.isArray(declarations)) {
-            lines.push(`  tool[${toolIndex}] function declarations (${declarations.length})`);
-            declarations.forEach((declaration, declarationIndex) => {
-                renderFunctionDeclaration(lines, declaration, declarationIndex, tools);
-            });
-        }
-
-        const remaining = Object.fromEntries(Object.entries(tool).filter(
-            ([key]) => key !== 'functionDeclarations'
-        ));
-        for (const [key, value] of Object.entries(remaining)) {
-            lines.push(`  tool[${toolIndex}] ${key}: ${json(value, tools.sanitize)}`);
-        }
-        if (!Array.isArray(declarations) && Object.keys(remaining).length === 0) {
-            lines.push(`  tool[${toolIndex}]: {}`);
-        }
+        if (tool.type === 'function') renderFunctionDeclaration(lines, tool, toolIndex, tools);
+        else lines.push(`  tool[${toolIndex}]: ${json(tool, tools.sanitize)}`);
     });
 }
 
@@ -290,8 +222,6 @@ function renderSystemInstruction(lines, instruction, tools) {
         lines.push('  (none)');
     } else if (typeof instruction === 'string') {
         textBlock(lines, instruction, tools.redactText);
-    } else if (instruction && typeof instruction === 'object' && Array.isArray(instruction.parts)) {
-        renderContents(lines, [instruction], tools, '  content');
     } else {
         lines.push(`  ${json(instruction, tools.sanitize)}`);
     }
@@ -304,9 +234,7 @@ function renderGenerationConfig(lines, config, tools) {
         return;
     }
 
-    const entries = Object.entries(config).filter(
-        ([key]) => !['systemInstruction', 'tools', 'safetySettings', 'httpOptions', 'abortSignal'].includes(key)
-    );
+    const entries = Object.entries(config);
     if (entries.length === 0) lines.push('  (defaults)');
     for (const [key, value] of entries) {
         lines.push(`  ${key}: ${json(value, tools.sanitize)}`);
@@ -325,32 +253,16 @@ function renderSafetySettings(lines, settings, tools) {
             lines.push(`  [${index}]: ${json(setting, tools.sanitize)}`);
             return;
         }
-        const category = tools.redactText(setting.category || '<unspecified>');
+        const category = tools.redactText(setting.type || '<unspecified>');
         const threshold = tools.redactText(setting.threshold || '<unspecified>');
         lines.push(`  [${index}] ${category}: ${threshold}`);
         const remaining = Object.fromEntries(Object.entries(setting).filter(
-            ([key]) => !['category', 'threshold'].includes(key)
+            ([key]) => !['type', 'threshold'].includes(key)
         ));
         if (Object.keys(remaining).length > 0) {
             lines.push(`    metadata: ${json(remaining, tools.sanitize)}`);
         }
     });
-}
-
-function renderSdkTransport(lines, httpOptions, tools) {
-    lines.push('SDK transport');
-    if (!httpOptions || typeof httpOptions !== 'object') {
-        lines.push(httpOptions == null ? '  (defaults)' : `  ${json(httpOptions, tools.sanitize)}`);
-        return;
-    }
-    const entries = Object.entries(httpOptions);
-    if (entries.length === 0) lines.push('  (defaults)');
-    for (const [key, value] of entries) {
-        const rendered = typeof value === 'string'
-            ? tools.redactText(value)
-            : json(value, tools.sanitize);
-        lines.push(`  ${key}: ${rendered}`);
-    }
 }
 
 function renderGeminiRequest({ call, request, policy }, tools) {
@@ -359,35 +271,17 @@ function renderGeminiRequest({ call, request, policy }, tools) {
         lines.push(`request: ${json(request, tools.sanitize)}`);
         return lines;
     }
-
-    const config = request.config;
-    lines.push('Application deadline');
-    lines.push(`  deadline: ${Number(policy?.deadlineMs || 0)}ms`);
-    lines.push(`  attempts: ${Number(config?.httpOptions?.retryOptions?.attempts || 0)}`);
-    lines.push(config?.httpOptions?.timeout == null
-        ? '  Google server deadline: SDK default'
-        : `  Google server deadline: ${Number(config.httpOptions.timeout)}ms`);
-
-    lines.push('Model');
-    lines.push(`  name: ${scalar(request.model, tools.redactText)}`);
-
-    renderSystemInstruction(lines, config?.systemInstruction, tools);
-
-    lines.push('Contents (ordered)');
-    renderContents(lines, request.contents, tools, '  contents');
-
-    renderTools(lines, config?.tools, tools);
-    renderSafetySettings(lines, config?.safetySettings, tools);
-    renderGenerationConfig(lines, config, tools);
-    renderSdkTransport(lines, config?.httpOptions, tools);
-
-    const remaining = Object.fromEntries(Object.entries(request).filter(
-        ([key]) => !['model', 'contents', 'config'].includes(key)
-    ));
-    if (Object.keys(remaining).length > 0) {
-        lines.push('Other request fields');
-        for (const [key, value] of Object.entries(remaining)) {
-            lines.push(`  ${key}: ${json(value, tools.sanitize)}`);
+    lines.push('Application deadline', `  deadline: ${Number(policy?.deadlineMs || 0)}ms`, '  attempts: 1');
+    lines.push('Model', `  name: ${scalar(request.model, tools.redactText)}`);
+    renderSystemInstruction(lines, request.system_instruction, tools);
+    lines.push('Input (ordered)');
+    renderSteps(lines, request.input, tools, '  input');
+    renderTools(lines, request.tools, tools);
+    renderSafetySettings(lines, request.safety_settings, tools);
+    renderGenerationConfig(lines, request.generation_config, tools);
+    for (const [key, value] of Object.entries(request)) {
+        if (!['model', 'input', 'system_instruction', 'tools', 'safety_settings', 'generation_config'].includes(key)) {
+            lines.push(`${key}: ${json(value, tools.sanitize)}`);
         }
     }
     return lines;
@@ -399,32 +293,9 @@ function renderGeminiResponse({ call, response }, tools) {
         lines.push(`response: ${json(response, tools.sanitize)}`);
         return lines;
     }
-
-    const candidates = response.candidates;
-    if (Array.isArray(candidates)) {
-        candidates.forEach((candidate, candidateIndex) => {
-            const content = candidate?.content;
-            lines.push(`candidates[${candidateIndex}] role=${tools.redactText(content?.role || '<none>')}`);
-            if (Array.isArray(content?.parts)) {
-                content.parts.forEach((part, partIndex) => {
-                    renderPart(lines, `candidates[${candidateIndex}].content.parts[${partIndex}]`, part, tools);
-                });
-            } else {
-                lines.push(`candidates[${candidateIndex}].content.parts: ${json(content?.parts, tools.sanitize)}`);
-            }
-            const remaining = Object.fromEntries(Object.entries(candidate || {}).filter(([key]) => key !== 'content'));
-            if (Object.keys(remaining).length > 0) {
-                lines.push(`candidates[${candidateIndex}] metadata: ${json(remaining, tools.sanitize)}`);
-            }
-        });
-    } else if ('candidates' in response) {
-        lines.push(`candidates: ${json(candidates, tools.sanitize)}`);
-    }
-
+    renderSteps(lines, response.steps, tools);
     for (const [key, value] of Object.entries(response)) {
-        if (!['candidates', 'sdkHttpResponse'].includes(key)) {
-            lines.push(`${key}: ${json(value, tools.sanitize)}`);
-        }
+        if (!['steps', 'sdkHttpResponse'].includes(key)) lines.push(`${key}: ${json(value, tools.sanitize)}`);
     }
     return lines;
 }

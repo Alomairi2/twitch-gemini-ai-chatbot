@@ -5,6 +5,7 @@ import type { BotSettings } from '../../lib/types';
 import { channelLabel, normChannel } from '../../lib/channel';
 import { FieldRow, inputCls, ResetTabButton, SectionTitle, selectCls, Toggle } from './SettingsPrimitives';
 import { channelJoinControls } from '../../lib/botStatusPresentation';
+import { CHAT_MODELS } from '../../../utils/chat_models.js';
 
 const connectionActionCls = 'flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-line bg-bg px-2.5 py-1.5 text-[11px] font-medium text-ink transition-colors hover:border-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60';
 
@@ -146,7 +147,7 @@ export default function ConfigurationTab({
       <SectionTitle>AI & search</SectionTitle>
       <FieldRow label="Gemini model">
         <select value={value.model_name} onChange={(event) => change('model_name', event.target.value)} className={selectCls}>
-          <option value="gemini-3.8-flash">Gemini 3.8 Flash</option><option value="gemini-3.7-flash">Gemini 3.7 Flash</option><option value="gemini-3.6-flash">Gemini 3.6 Flash</option><option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+          {CHAT_MODELS.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
         </select>
       </FieldRow>
       <FieldRow label="Thinking level">

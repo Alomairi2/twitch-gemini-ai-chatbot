@@ -5,10 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotError } from '../utils/error_handler.js';
 import { ImageDownloader } from '../utils/image_downloader.js';
+import { assertInteractionSucceeded } from '../ai/interaction_response.js';
 
 const CATALOG_TTL_MS = 60 * 60 * 1000;
 const VIDEO_TIMEOUT_MS = 7 * 60 * 1000;
 const VIDEO_POLL_MS = 10_000;
+const GENERATION_TIMEOUT_MS = 60_000;
 const ROTATE_STATUSES = new Set([401, 403, 429, 503]);
 
 const GOOGLE_TTS_VOICES = Object.freeze([
@@ -59,11 +61,11 @@ function isOmniVideoModel(id) {
 }
 
 function isTtsModel(id) {
-    return /^gemini-\d+(?:\.\d+)*-(?:flash|pro)(?:-lite)?-tts(?:-[a-z0-9]+)*$/.test(id);
+    return /^gemini-\d+(?:\.\d+)*-(?:flash|pro)(?:-lite)?(?:-preview)?-tts(?:-[a-z0-9]+)*$/.test(id);
 }
 
 function isMusicModel(id) {
-    return /^lyria-\d+(?:\.\d+)*-(?:clip|pro)(?:-[a-z0-9]+)*$/.test(id);
+    return /^lyria-\d+(?:\.\d+)*(?:-(?:clip|pro)(?:-[a-z0-9]+)*)?$/.test(id);
 }
 
 // Keep catalog filtering and saved-target validation on the same generation families.
@@ -76,22 +78,29 @@ function mediaTypeForModel(id) {
     return null;
 }
 
-function supportsGenerationAction(model, id, type) {
+// Cloud image/TTS and Developer 2.5 TTS require the content API. Other
+// discovered families use Interactions, apart from Veo's dedicated API.
+function usesContentApi(type, id, backendKind) {
+    return (type === 'image' || type === 'tts')
+        && (backendKind === 'vertex' || (type === 'tts' && id.startsWith('gemini-2.5-')));
+}
+
+function supportsGenerationAction(model, id, type, backendKind) {
     // Vertex discovery omits actions. Interactions models have no corresponding
     // models API action, so their supported family remains the routing constraint.
-    const action = type === 'image' || type === 'tts' ? 'generateContent'
-        : isVeoModel(id) ? 'predictLongRunning' : null;
+    const action = isVeoModel(id) ? 'predictLongRunning'
+        : usesContentApi(type, id, backendKind) ? 'generateContent' : null;
     return !action || !Array.isArray(model?.supportedActions) || model.supportedActions.includes(action);
 }
 
-function classifyGoogleModels(models) {
+function classifyGoogleModels(models, backendKind) {
     const catalog = { image: [], video: [], tts: [], music: [] };
     const seen = new Set();
     for (const model of models || []) {
         const id = canonicalModelId(model);
         if (!id || seen.has(id)) continue;
         const type = mediaTypeForModel(id);
-        if (!type || !supportsGenerationAction(model, id, type)) continue;
+        if (!type || !supportsGenerationAction(model, id, type, backendKind)) continue;
         seen.add(id);
         catalog[type].push({
             provider: 'google', id,
@@ -113,12 +122,12 @@ function statusOf(error) {
 }
 
 function translateGoogleError(error, mediaType) {
-    if (error instanceof BotError) return error;
     const status = statusOf(error);
     const message = String(error?.message || error || '');
-    if (status === 404 || /(?:model|publisher model).*(?:not found|unsupported|does not exist)/i.test(message)) {
+    if (status === 404 || /(?:model|publisher model).*(?:not found|unsupported|not supported|does not exist)|(?:unsupported|not supported).*model/i.test(message)) {
         return new BotError('MEDIA_MODEL_UNAVAILABLE', { status, cause: error, params: { mediaType } });
     }
+    if (error instanceof BotError) return error;
     if (/safety|blocked|prohibited content|responsible ai/i.test(message)) {
         return new BotError('CONTENT_BLOCKED', { status, cause: error });
     }
@@ -127,7 +136,9 @@ function translateGoogleError(error, mediaType) {
     }
     if (status === 400) return new BotError('HTTP_400', { status, cause: error });
     if (status && status >= 500) return new BotError(status === 504 ? 'HTTP_504' : 'HTTP_500', { status, cause: error });
-    if (error?.name === 'AbortError') return new BotError('REQUEST_TIMEOUT', { cause: error });
+    if (error?.name === 'AbortError' || /timed out|timeout/i.test(message)) {
+        return new BotError('REQUEST_TIMEOUT', { cause: error });
+    }
     return error;
 }
 
@@ -144,51 +155,51 @@ async function modelList(pager) {
     return [];
 }
 
-function responseParts(response) {
-    return response?.candidates?.flatMap((candidate) => candidate?.content?.parts || [])
-        || response?.parts
-        || [];
-}
-
-function firstInlineMedia(response, prefix) {
-    for (const part of responseParts(response)) {
-        const inline = part?.inlineData || part?.inline_data;
-        if (!inline?.data) continue;
-        const mimeType = inline.mimeType || inline.mime_type || '';
-        if (!mimeType || mimeType.startsWith(`${prefix}/`)) {
-            return { buffer: Buffer.from(inline.data, 'base64'), mimeType: mimeType || `${prefix}/*` };
-        }
-    }
-    return null;
-}
-
 function pcmSampleRate(mimeType) {
     const match = String(mimeType || '').match(/(?:^|;)\s*rate=(\d+)/i);
     return match ? Number(match[1]) : 24_000;
 }
 
-function interactionMedia(interaction, kind) {
-    const direct = interaction?.[`output_${kind}`] || interaction?.[`output${kind[0].toUpperCase()}${kind.slice(1)}`];
-    if (direct?.data) {
-        return {
-            buffer: Buffer.from(direct.data, 'base64'),
-            mimeType: direct.mime_type || direct.mimeType || `${kind}/*`,
-            sampleRate: direct.sample_rate,
-            channels: direct.channels
-        };
+function contentMedia(response, kind) {
+    if (response?.promptFeedback?.blockReason
+        || response?.candidates?.some(candidate => /SAFETY|PROHIBITED|BLOCKLIST|RECITATION/.test(candidate.finishReason || ''))) {
+        throw new BotError('CONTENT_BLOCKED');
     }
-    const prefix = kind === 'audio' ? 'audio' : kind;
+    for (const candidate of response?.candidates || []) {
+        for (const part of candidate.content?.parts || []) {
+            const inline = part.inlineData;
+            if (inline?.data && (!inline.mimeType || inline.mimeType.startsWith(`${kind}/`))) {
+                return { buffer: Buffer.from(inline.data, 'base64'), mimeType: inline.mimeType || `${kind}/*` };
+            }
+        }
+    }
+    return null;
+}
+
+function interactionMedia(interaction, kind) {
+    // Keep the pipeline's one-artifact contract. SDK convenience properties
+    // select the last block, so prefer the first generated block in the timeline.
     for (const step of interaction?.steps || []) {
+        if (step.type !== 'model_output') continue;
         for (const content of step?.content || []) {
             if (content?.type === kind && content.data) {
                 return {
                     buffer: Buffer.from(content.data, 'base64'),
-                    mimeType: content.mime_type || `${prefix}/*`,
+                    mimeType: content.mime_type || `${kind}/*`,
                     sampleRate: content.sample_rate,
                     channels: content.channels
                 };
             }
         }
+    }
+    const direct = interaction?.[`output_${kind}`];
+    if (direct?.data) {
+        return {
+            buffer: Buffer.from(direct.data, 'base64'),
+            mimeType: direct.mime_type || `${kind}/*`,
+            sampleRate: direct.sample_rate,
+            channels: direct.channels
+        };
     }
     return null;
 }
@@ -226,7 +237,8 @@ export class GoogleProvider {
         sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         catalogTtlMs = CATALOG_TTL_MS,
         videoTimeoutMs = VIDEO_TIMEOUT_MS,
-        videoPollMs = VIDEO_POLL_MS
+        videoPollMs = VIDEO_POLL_MS,
+        generationTimeoutMs = GENERATION_TIMEOUT_MS
     } = {}) {
         this.id = 'google';
         this.name = this.id;
@@ -234,12 +246,12 @@ export class GoogleProvider {
         this.clients = googleBackend?.kind === 'vertex'
             ? [{
                 client: clientFactory({
-                    vertexai: true,
+                    enterprise: true,
                     project: googleBackend.projectId,
                     location: 'global'
                 }),
                 regionalClient: clientFactory({
-                    vertexai: true,
+                    enterprise: true,
                     project: googleBackend.projectId,
                     location: 'us-central1'
                 })
@@ -256,6 +268,7 @@ export class GoogleProvider {
         this.catalogTtlMs = catalogTtlMs;
         this.videoTimeoutMs = videoTimeoutMs;
         this.videoPollMs = videoPollMs;
+        this.generationTimeoutMs = generationTimeoutMs;
         this.capabilities = { mediaTypes: new Set(['image', 'video', 'tts', 'music']) };
         this.#catalogState = { data: null, successAt: 0, failedAt: 0 };
     }
@@ -286,7 +299,7 @@ export class GoogleProvider {
 
     async #discover() {
         return this.#withRotation(async (entry) => classifyGoogleModels(
-            await modelList(await (entry.regionalClient || entry.client).models.list())
+            await modelList(await (entry.regionalClient || entry.client).models.list()), this.googleBackend?.kind
         ));
     }
 
@@ -337,23 +350,6 @@ export class GoogleProvider {
         }
     }
 
-    async #generateImage(prompt, target) {
-        const input = await this.#referenceInput(prompt, 'image');
-        return this.#withRotation(async ({ client }) => {
-            const contents = input.image
-                ? [{ text: input.prompt }, { inlineData: { mimeType: input.image.mimeType, data: input.image.data } }]
-                : input.prompt;
-            const response = await client.models.generateContent({
-                model: target.model,
-                contents,
-                config: { responseModalities: ['IMAGE'] }
-            });
-            const media = firstInlineMedia(response, 'image');
-            if (!media) throw new BotError('MEDIA_NO_DATA', { params: { service: this.id, mediaType: 'image' } });
-            return media;
-        }, 'image');
-    }
-
     async #videoBuffer(entry, video) {
         if (video?.videoBytes) return Buffer.from(video.videoBytes, 'base64');
         if (!video?.uri) return null;
@@ -402,32 +398,6 @@ export class GoogleProvider {
         return { buffer, mimeType: video?.mimeType || 'video/mp4' };
     }
 
-    async #generateTts(prompt, target) {
-        return this.#withRotation(async ({ client }) => {
-            const response = await client.models.generateContent({
-                model: target.model,
-                contents: String(prompt || ''),
-                config: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: {
-                        voiceConfig: {
-                            prebuiltVoiceConfig: { voiceName: target.voice || 'Kore' }
-                        }
-                    }
-                }
-            });
-            const media = firstInlineMedia(response, 'audio');
-            if (!media?.buffer?.length) {
-                throw new BotError('MEDIA_NO_DATA', { params: { service: this.id, mediaType: 'tts' } });
-            }
-            if (!/pcm|l16/i.test(media.mimeType)) return media;
-            return {
-                buffer: pcmToWav(media.buffer, { sampleRate: pcmSampleRate(media.mimeType) }),
-                mimeType: 'audio/wav'
-            };
-        }, 'tts');
-    }
-
     async #generateInteraction(type, prompt, target) {
         const input = await this.#referenceInput(prompt, type);
         return this.#withRotation(async ({ client }) => {
@@ -437,27 +407,71 @@ export class GoogleProvider {
                     { type: 'image', mime_type: input.image.mimeType, data: input.image.data }
                 ]
                 : input.prompt;
-            const request = { model: target.model, input: interactionInput };
-            if (type === 'video') {
-                request.response_format = { type: 'video' };
-            } else if (type === 'music' && target.model.includes('-pro-')) {
-                request.response_format = { type: 'audio' };
+            const kind = type === 'image' ? 'image' : type === 'video' ? 'video' : 'audio';
+            const request = { model: target.model, input: interactionInput, store: false };
+            request.response_format = { type: kind };
+            if (type === 'tts') {
+                request.generation_config = { speech_config: [{ voice: target.voice || 'Kore' }] };
+                request.response_format.mime_type = 'audio/wav';
             }
-            const interaction = await client.interactions.create(request);
-            const kind = type === 'video' ? 'video' : 'audio';
+            const interaction = await client.interactions.create(request, {
+                timeout_ms: type === 'video' || type === 'music' ? this.videoTimeoutMs : this.generationTimeoutMs,
+                retries: { strategy: 'none' }
+            });
+            assertInteractionSucceeded(interaction);
             const media = interactionMedia(interaction, kind);
             if (!media?.buffer?.length) throw new BotError('MEDIA_NO_DATA', { params: { service: this.id, mediaType: type } });
-            return { buffer: media.buffer, mimeType: media.mimeType || (type === 'video' ? 'video/mp4' : 'audio/mpeg') };
+            if (kind === 'audio' && /pcm|l16/i.test(media.mimeType)) {
+                return {
+                    buffer: pcmToWav(media.buffer, {
+                        sampleRate: media.sampleRate || pcmSampleRate(media.mimeType),
+                        channels: media.channels || 1
+                    }),
+                    mimeType: 'audio/wav'
+                };
+            }
+            return { buffer: media.buffer, mimeType: media.mimeType };
+        }, type);
+    }
+
+    // Cloud image/TTS and Developer 2.5 TTS still require this API.
+    // Keep the exception here; chat and supported media use Interactions.
+    async #generateContentMedia(type, prompt, target) {
+        const input = await this.#referenceInput(prompt, type);
+        return this.#withRotation(async ({ client }) => {
+            const kind = type === 'image' ? 'image' : 'audio';
+            const response = await client.models.generateContent({
+                model: target.model,
+                contents: input.image
+                    ? [{ text: input.prompt }, { inlineData: { mimeType: input.image.mimeType, data: input.image.data } }]
+                    : input.prompt,
+                config: {
+                    responseModalities: [kind.toUpperCase()],
+                    ...(type === 'tts' ? {
+                        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: target.voice || 'Kore' } } }
+                    } : {}),
+                    httpOptions: { timeout: this.generationTimeoutMs, retryOptions: { attempts: 1 } }
+                }
+            });
+            const media = contentMedia(response, kind);
+            if (!media?.buffer?.length) throw new BotError('MEDIA_NO_DATA', { params: { service: this.id, mediaType: type } });
+            if (kind === 'audio' && /pcm|l16/i.test(media.mimeType)) {
+                return { buffer: pcmToWav(media.buffer, { sampleRate: pcmSampleRate(media.mimeType) }), mimeType: 'audio/wav' };
+            }
+            return media;
         }, type);
     }
 
     async generate({ type, prompt, target = {} } = {}) {
         target = this.#resolveTarget(type, target);
         try {
-            if (type === 'image') return await this.#generateImage(prompt, target);
+            if (usesContentApi(type, target.model, this.googleBackend?.kind)) {
+                return await this.#generateContentMedia(type, prompt, target);
+            }
+            if (type === 'image') return await this.#generateInteraction(type, prompt, target);
             if (type === 'video' && isVeoModel(target.model)) return await this.#generateVeo(prompt, target);
             if (type === 'video' && isOmniVideoModel(target.model)) return await this.#generateInteraction(type, prompt, target);
-            if (type === 'tts' && isTtsModel(target.model)) return await this.#generateTts(prompt, target);
+            if (type === 'tts' && isTtsModel(target.model)) return await this.#generateInteraction(type, prompt, target);
             if (type === 'music' && isMusicModel(target.model)) return await this.#generateInteraction(type, prompt, target);
             throw new BotError('MEDIA_MODEL_UNAVAILABLE', { params: { mediaType: type } });
         } catch (error) {

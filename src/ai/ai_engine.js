@@ -2,8 +2,9 @@ import { GoogleGenAI } from '@google/genai';
 import ErrorHandler, { BotError } from '../utils/error_handler.js';
 import { ImageDownloader } from '../utils/image_downloader.js';
 import { ToolDispatcher } from './tool_dispatcher.js';
+import { assertInteractionSucceeded } from './interaction_response.js';
+import { DEFAULT_CHAT_MODEL, normalizeChatModel } from '../utils/chat_models.js';
 
-const DEFAULT_MODEL = 'gemini-3.8-flash';
 const DEFAULT_MODEL_ATTEMPT_TIMEOUT_MS = 35_000;
 const ALLOWED_THINKING_LEVELS = new Set(['low', 'medium', 'high']);
 const ROTATE_WORTHY_MODEL_STATUSES = new Set([401, 403, 429, 503]);
@@ -39,7 +40,7 @@ export class AIEngine {
 
     constructor({
         googleBackend,
-        modelName = DEFAULT_MODEL,
+        modelName = DEFAULT_CHAT_MODEL,
         fileContext = 'You are a helpful Twitch Chatbot.',
         historyLength = 5,
         enableSearchGrounding = false,
@@ -62,7 +63,7 @@ export class AIEngine {
         this.googleBackend = googleBackend;
         this.#clients = googleBackend?.kind === 'vertex'
             ? [clientFactory({
-                vertexai: true,
+                enterprise: true,
                 project: googleBackend.projectId,
                 location: 'global'
             })]
@@ -70,7 +71,7 @@ export class AIEngine {
                 .map((apiKey) => clientFactory({ apiKey }));
         if (this.#clients.length === 0) throw new Error('No Google backend configured');
 
-        this.modelName = modelName;
+        this.modelName = normalizeChatModel(modelName);
         this.fileContext = fileContext;
         this.historyLength = parseInt(historyLength, 10) || 5;
 
@@ -177,14 +178,16 @@ export class AIEngine {
 
         this.#checkHistoryLength(channel);
         const history = this.getHistory(channel);
-        history.push({ role: 'user', parts: structuredClone(userParts) });
-        history.push({ role: 'model', parts: structuredClone(modelParts) });
+        history.push({ type: 'user_input', content: structuredClone(userParts) });
+        history.push({ type: 'model_output', content: structuredClone(modelParts) });
     }
 
     #checkHistoryLength(channel) {
         const history = this.getHistory(channel);
-        while (history.length / 2 > this.historyLength) {
-            history.splice(0, 2);
+        while (history.filter(step => step.type === 'user_input').length > this.historyLength) {
+            const nextTurn = history.findIndex((step, index) => index > 0 && step.type === 'user_input');
+            if (nextTurn < 0) break;
+            history.splice(0, nextTurn);
         }
     }
 
@@ -197,7 +200,7 @@ export class AIEngine {
     }
 
     /**
-     * Compiles trusted behavioral instructions for Gemini's systemInstruction wire field.
+     * Compiles trusted behavioral instructions for Gemini's system_instruction wire field.
      */
     #compileSystemInstruction({
         channelContext,
@@ -299,15 +302,15 @@ export class AIEngine {
             };
         }
 
-        return { text: JSON.stringify({ runtimeContext }) };
+        return { type: 'text', text: JSON.stringify({ runtimeContext }) };
     }
 
     /**
-     * Formats user parts into text, YouTube fileData, or inline image base64 data.
+     * Builds typed text, YouTube video, and inline image content blocks.
      */
     async #buildUserParts(text, { disableMultimedia }) {
         if (disableMultimedia) {
-            return { memoryUserParts: [{ text }], allUrls: [], youtubeMatch: null, imageUrl: null, operationalFacts: null };
+            return { memoryUserParts: [{ type: 'text', text }], allUrls: [], youtubeMatch: null, imageUrl: null, operationalFacts: null };
         }
 
         const allUrls = text.match(URL_RE) || [];
@@ -327,14 +330,11 @@ export class AIEngine {
             const rawUrl = youtubeMatch[0];
             const id = AIEngine.extractYouTubeVideoId(rawUrl);
             const fileUri = id ? `https://www.youtube.com/watch?v=${id}` : rawUrl;
-            const fileData = { fileUri };
-            if (this.googleBackend?.kind === 'vertex') {
-                fileData.mimeType = 'video/mp4';
-            }
+            const video = { type: 'video', uri: fileUri, mime_type: 'video/mp4' };
             return {
                 memoryUserParts: [
-                    { text: text.replace(rawUrl, '').trim() },
-                    { fileData }
+                    { type: 'text', text: text.replace(rawUrl, '').trim() },
+                    video
                 ],
                 allUrls,
                 youtubeMatch,
@@ -347,12 +347,12 @@ export class AIEngine {
             try {
                 const img = await this.#imageDownloader.downloadImageAsBase64(imageUrl);
                 const memoryUserParts = img
-                    ? [{ text: text.replace(imageUrl, '').trim() }, { inlineData: { mimeType: img.mimeType, data: img.data } }]
-                    : [{ text }];
+                    ? [{ type: 'text', text: text.replace(imageUrl, '').trim() }, { type: 'image', mime_type: img.mimeType, data: img.data }]
+                    : [{ type: 'text', text }];
                 return { memoryUserParts, allUrls, youtubeMatch: null, imageUrl, operationalFacts: null };
             } catch (e) {
                 return {
-                    memoryUserParts: [{ text }],
+                    memoryUserParts: [{ type: 'text', text }],
                     allUrls,
                     youtubeMatch: null,
                     imageUrl,
@@ -361,7 +361,7 @@ export class AIEngine {
             }
         }
 
-        return { memoryUserParts: [{ text }], allUrls, youtubeMatch: null, imageUrl: null, operationalFacts: null };
+        return { memoryUserParts: [{ type: 'text', text }], allUrls, youtubeMatch: null, imageUrl: null, operationalFacts: null };
     }
 
     /**
@@ -375,7 +375,7 @@ export class AIEngine {
     /**
      * Executes generation call via the Google GenAI SDK.
      */
-    async #executeModelCall({ contents, systemInstruction, safetySettings, tools, keyIndex, trace }) {
+    async #executeModelCall({ contents, systemInstruction, tools, keyIndex, trace }) {
         const policy = { deadlineMs: this.modelAttemptTimeoutMs };
         const controller = new AbortController();
         let applicationTimedOut = false;
@@ -383,33 +383,33 @@ export class AIEngine {
             applicationTimedOut = true;
             controller.abort();
         }, policy.deadlineMs);
-        const config = {
-            maxOutputTokens: 8192,
-            thinkingConfig: {
-                thinkingLevel: this.thinkingLevel,
-                includeThoughts: true
-            },
-            tools,
-            systemInstruction,
-            safetySettings,
-            abortSignal: controller.signal,
-            httpOptions: {
-                retryOptions: { attempts: 1 }
-            }
-        };
-
         const client = this.#clients[keyIndex];
         const request = {
-            model: this.modelName,
-            contents,
-            config
+            model: this.modelName.replace(/^models\//, ''),
+            input: contents,
+            store: false,
+            system_instruction: systemInstruction,
+            tools,
+            generation_config: {
+                max_output_tokens: 8192,
+                thinking_level: this.thinkingLevel,
+                thinking_summaries: 'auto'
+            },
+            ...(this.googleBackend?.kind === 'vertex' ? {
+                safety_settings: ['harassment', 'hate_speech', 'sexually_explicit', 'dangerous_content']
+                    .map(type => ({ type, threshold: 'block_none' }))
+            } : {})
         };
         const call = trace?.nextGeminiCall?.() || 0;
         const started = performance.now();
         trace?.event?.('gemini.request', { call, request, policy });
         let result;
         try {
-            result = await client.models.generateContent(request);
+            result = await client.interactions.create(request, {
+                signal: controller.signal,
+                retries: { strategy: 'none' }
+            });
+            assertInteractionSucceeded(result, { allowIncompleteText: true });
         } catch (error) {
             const normalizedError = applicationTimedOut
                 ? new BotError('REQUEST_TIMEOUT', { cause: error })
@@ -456,7 +456,6 @@ export class AIEngine {
     async #executeModelTurn({
         contents,
         systemInstruction,
-        safetySettings,
         tools,
         generationState,
         disableGoogleGrounding,
@@ -464,13 +463,13 @@ export class AIEngine {
     }) {
         const startingKeyIndex = this.currentKeyIndex;
         const failures = [];
+        let attemptSystemInstruction = systemInstruction;
 
         for (let visited = 0; visited < this.#clients.length; visited++) {
             const keyIndex = (startingKeyIndex + visited) % this.#clients.length;
             let attemptTools = generationState.googleGroundingDisabled
                 ? this.#toolDispatcher.withoutGoogleSearch(tools)
                 : tools;
-            let attemptSystemInstruction = systemInstruction;
 
             const attempt = async () => {
                 const attemptStarted = Date.now();
@@ -478,7 +477,6 @@ export class AIEngine {
                     const completed = await this.#executeModelCall({
                         contents,
                         systemInstruction: attemptSystemInstruction,
-                        safetySettings,
                         tools: attemptTools,
                         keyIndex,
                         trace
@@ -580,45 +578,31 @@ export class AIEngine {
         throw relevantFailure || failures.at(-1) || new BotError('UNKNOWN_ERROR');
     }
 
-    #extractCandidateContent(result) {
-        const candidate = result?.candidates?.[0];
-        const rawParts = candidate?.content?.parts || [];
-        const thoughtParts = rawParts.filter(p => p.thought === true);
-        const textParts = rawParts.filter(
-            p => !p.thought && typeof p.text === 'string' && p.text.trim().length > 0
-        );
-        const winningTextPart = textParts[textParts.length - 1] || null;
-        return { candidate, thoughtParts, textParts, winningTextPart, rawParts };
+    #extractResponse(result) {
+        if (!['completed', 'incomplete'].includes(result?.status)) return { text: '', memorySteps: [] };
+        const steps = result?.steps || [];
+        const output = steps.findLast(step => step.type === 'model_output');
+        const text = (output?.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('');
+        // Only the final conversational output and its thought signatures enter
+        // memory. Tool results and built-in grounding steps remain turn-local.
+        const memorySteps = text.trim()
+            ? steps.filter(step => step.type === 'thought' || step === output).map(step => step === output
+                ? { ...step, content: step.content.filter(part => part.type === 'text') }
+                : step)
+            : [];
+        return { text, memorySteps };
     }
 
     #logTurnParts(result) {
-        const { thoughtParts, rawParts } = this.#extractCandidateContent(result);
-        if (thoughtParts.length > 0) {
-            this.#logSubsection('Thinking', COLORS.magenta);
-            thoughtParts.forEach(p => {
-                const lines = String(p.text || '').split('\n');
-                lines.forEach(line => console.log(`   ${COLORS.magenta}${line}${COLORS.reset}`));
-            });
+        for (const step of result?.steps || []) {
+            if (step.type === 'thought') {
+                for (const part of step.summary || []) {
+                    if (part.type === 'text') console.log(`   ${COLORS.magenta}${part.text}${COLORS.reset}`);
+                }
+            } else if (step.type === 'function_call') {
+                console.log(`   ${COLORS.dim}│${COLORS.reset} ${step.name}(${JSON.stringify(step.arguments ?? {})})`);
+            }
         }
-        const calls = rawParts.filter(p => p.functionCall || p.function_call);
-        if (calls.length > 0) {
-            this.#logSubsection('Function Calls', COLORS.yellow);
-            calls.forEach(p => {
-                const fc = p.functionCall || p.function_call;
-                console.log(`   ${COLORS.dim}│${COLORS.reset} ${fc.name}(${JSON.stringify(fc.args ?? {})})`);
-            });
-        }
-    }
-
-    /**
-     * Builds candidate parts array for conversational memory or retry payloads.
-     * Preserves thought and signature-bearing parts unmodified in original order,
-     * including empty signature carriers, plus the winning conversational text part.
-     * Strips other inline data, file data, and non-winning text parts.
-     */
-    #buildCandidatePartsForMemory(rawParts, winningTextPart) {
-        if (!winningTextPart) return [];
-        return rawParts.filter(p => p.thought === true || p.thoughtSignature != null || p === winningTextPart);
     }
 
     #getKeyErrorReason(error) {
@@ -716,20 +700,10 @@ export class AIEngine {
         const requestUserParts = [runtimeContextPart, ...memoryUserParts];
 
         const history = this.getHistory(channel);
-        const contents = [...history, { role: 'user', parts: requestUserParts }];
-
-        const safetySettings = [
-            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-        ];
+        const contents = [...history, { type: 'user_input', content: requestUserParts }];
 
         if (tools?.length) {
-            const names = tools.flatMap(t => t.functionDeclarations
-                ? t.functionDeclarations.map(d => d.name)
-                : Object.keys(t));
-            console.log(`   ${COLORS.dim}Tools:${COLORS.reset} ${names.join(', ')}`);
+            console.log(`   ${COLORS.dim}Tools:${COLORS.reset} ${tools.map(tool => tool.name || tool.type).join(', ')}`);
         }
 
         let result = null;
@@ -758,7 +732,6 @@ export class AIEngine {
                     const turnResult = await this.#executeModelTurn({
                         contents: turnContents,
                         systemInstruction: activeSystemInstruction,
-                        safetySettings,
                         tools: turnTools,
                         generationState,
                         disableGoogleGrounding,
@@ -768,10 +741,10 @@ export class AIEngine {
                     return turnResult;
                 }
             });
-            if (loop.stopped === 'error') {
+            if (loop.stopped === 'error' || loop.stopped === 'ceiling') {
                 return {
                     toolError: true,
-                    errorKey: loop.errorKey || 'HELIX_ACTION_FAILED'
+                    errorKey: loop.errorKey || 'GEMINI_EMPTY_RESPONSE'
                 };
             }
             return loop.result;
@@ -790,48 +763,14 @@ export class AIEngine {
 
         this.#logSection('GEMINI RESPONSE');
 
-        // Check for prompt blocks
-        if (result.promptFeedback?.blockReason) {
-            const errMsg = this.errorHandler.format({
-                blockReason: result.promptFeedback.blockReason,
-                promptFeedback: result.promptFeedback
-            });
-            trace?.markRejected?.(`Gemini blocked prompt: ${result.promptFeedback.blockReason}`);
-            console.log(`   ${COLORS.red}✗ Blocked:${COLORS.reset} ${errMsg}`);
+        const extracted = this.#extractResponse(result);
+        let agentResponse = extracted.text;
+        let latestSuccessfulSteps = extracted.memorySteps;
+        if (!agentResponse.trim()) {
+            trace?.markFailed?.('GEMINI_EMPTY_RESPONSE');
             this.#logFooter();
-            return errMsg;
+            return this.errorHandler.format('GEMINI_EMPTY_RESPONSE');
         }
-
-        // Check for safety finish reason
-        const finishReason = result.candidates?.[0]?.finishReason;
-        const safetyRatings = result.candidates?.[0]?.safetyRatings;
-        if (finishReason === 'SAFETY' || finishReason === 'IMAGE_SAFETY') {
-            const errMsg = this.errorHandler.format({
-                finishReason,
-                safetyRatings
-            });
-            trace?.markRejected?.(`Gemini safety finish: ${finishReason}`);
-            console.log(`   ${COLORS.red}✗ Safety:${COLORS.reset} ${errMsg}`);
-            this.#logFooter();
-            return errMsg;
-        }
-
-        // Extract thoughts and text parts
-        const { candidate, thoughtParts, textParts, winningTextPart, rawParts } = this.#extractCandidateContent(result);
-
-        if (textParts.length === 0) {
-            if (thoughtParts.length > 0) {
-                console.log(`   ${COLORS.yellow}⚠️${COLORS.reset} Model returned thoughts but no final response`);
-            }
-            const errMsg = this.errorHandler.format('GEMINI_EMPTY_RESPONSE');
-            trace?.markFailed?.('Gemini returned no final response');
-            console.log(`   ${COLORS.red}✗${COLORS.reset} ${errMsg}`);
-            this.#logFooter();
-            return errMsg;
-        }
-
-        let agentResponse = winningTextPart.text;
-        let latestSuccessfulParts = this.#buildCandidatePartsForMemory(rawParts, winningTextPart);
 
         // Length retry loop
         let retries = 0;
@@ -843,26 +782,24 @@ export class AIEngine {
 
             const retryContents = [
                 ...history,
-                { role: 'user', parts: requestUserParts },
-                { role: 'model', parts: latestSuccessfulParts },
-                { role: 'user', parts: [{ text: responseTooLongInstruction(this.maxResponseLength, currentMax) }] }
+                { type: 'user_input', content: requestUserParts },
+                ...latestSuccessfulSteps,
+                { type: 'user_input', content: [{ type: 'text', text: responseTooLongInstruction(this.maxResponseLength, currentMax) }] }
             ];
 
             try {
                 const retryResult = await this.#executeModelTurn({
                     contents: retryContents,
                     systemInstruction: activeSystemInstruction,
-                    safetySettings,
                     tools: this.#toolDispatcher.withoutFunctionDeclarations(activeTools),
                     generationState,
                     disableGoogleGrounding,
                     trace
                 });
-                const retryExtracted = this.#extractCandidateContent(retryResult);
-                const retryTextPart = retryExtracted.winningTextPart;
-                if (retryTextPart && retryTextPart.text.trim()) {
-                    agentResponse = retryTextPart.text;
-                    latestSuccessfulParts = this.#buildCandidatePartsForMemory(retryExtracted.rawParts, retryTextPart);
+                const retryExtracted = this.#extractResponse(retryResult);
+                if (retryExtracted.text.trim()) {
+                    agentResponse = retryExtracted.text;
+                    latestSuccessfulSteps = retryExtracted.memorySteps;
                 }
             } catch (retryError) {
                 console.log(`   ${COLORS.yellow}⚠️${COLORS.reset} Length retry #${retries} failed (${this.#getKeyErrorReason(retryError)}), using existing response`);
@@ -885,57 +822,10 @@ export class AIEngine {
         this.#logSubsection('Text Response', COLORS.green);
         console.log(`   ${COLORS.green}${agentResponse}${COLORS.reset}`);
 
-        const urlMeta = candidate?.urlContextMetadata || candidate?.url_context_metadata;
-        if (urlMeta) {
-            this.#logSubsection('URL Context', COLORS.green);
-            const entries = urlMeta.urlMetadata || urlMeta.url_metadata || [];
-            entries.forEach(entry => {
-                const url = entry.retrievedUrl || entry.retrieved_url || '';
-                const status = entry.urlRetrievalStatus || entry.url_retrieval_status || '';
-                console.log(`   ${COLORS.dim}│${COLORS.reset} ${url} ${COLORS.dim}${status}${COLORS.reset}`);
-            });
-        }
-
-        const groundingMetadata = candidate?.groundingMetadata;
-        if (groundingMetadata && (groundingMetadata.webSearchQueries?.length > 0 || groundingMetadata.groundingChunks?.length > 0)) {
-            this.#logSubsection('Grounding', COLORS.blue);
-
-            if (groundingMetadata.webSearchQueries?.length > 0) {
-                console.log(`   ${COLORS.dim}Queries:${COLORS.reset} ${groundingMetadata.webSearchQueries.join(' │ ')}`);
-            }
-
-            if (groundingMetadata.groundingChunks?.length > 0) {
-                console.log(`   ${COLORS.dim}Sources:${COLORS.reset}`);
-                groundingMetadata.groundingChunks.forEach(chunk => {
-                    if (chunk.web) {
-                        console.log(`   ${COLORS.dim}│${COLORS.reset} ${chunk.web.title || chunk.web.uri}`);
-                    }
-                });
-            }
-
-            if (groundingMetadata.groundingSupports?.length > 0) {
-                console.log(`   ${COLORS.dim}Supports:${COLORS.reset}`);
-                groundingMetadata.groundingSupports.forEach(support => {
-                    const quote = support.segment?.text?.substring(0, 50) || '';
-                    const sources = (support.groundingChunkIndices || [])
-                        .map(i => groundingMetadata.groundingChunks?.[i]?.web?.title || `[${i}]`)
-                        .join(', ');
-                    console.log(`   ${COLORS.dim}│${COLORS.reset} "${quote}..." → ${sources}`);
-                });
-            }
-        }
-
-        if (result.usageMetadata) {
-            const usage = result.usageMetadata;
+        if (result.usage) {
+            const usage = result.usage;
             this.#logSubsection('Usage');
-            const partsStr = [
-                `Prompt: ${usage.promptTokenCount || 0}`,
-                `Response: ${usage.candidatesTokenCount || 0}`,
-                usage.thoughtsTokenCount ? `Thinking: ${usage.thoughtsTokenCount}` : null,
-                `Total: ${usage.totalTokenCount || 0}`,
-                usage.cachedContentTokenCount ? `Cached: ${usage.cachedContentTokenCount}` : null
-            ].filter(Boolean).join(' │ ');
-            console.log(`   ${partsStr}`);
+            console.log(`   Prompt: ${usage.total_input_tokens || 0} │ Response: ${usage.total_output_tokens || 0} │ Thinking: ${usage.total_thought_tokens || 0} │ Total: ${usage.total_tokens || 0}`);
         }
 
         const elapsed = ((Date.now() - started) / 1000).toFixed(2);
@@ -943,8 +833,8 @@ export class AIEngine {
         this.#logFooter();
 
         if (recordMemory) {
-            history.push({ role: 'user', parts: memoryUserParts });
-            history.push({ role: 'model', parts: latestSuccessfulParts });
+            history.push({ type: 'user_input', content: memoryUserParts });
+            history.push(...latestSuccessfulSteps);
         }
 
         return agentResponse;
@@ -1029,7 +919,7 @@ export class AIEngine {
         historyLength,
         tavilySearchDepth
     } = {}) {
-        if (modelName) this.modelName = String(modelName);
+        if (modelName) this.modelName = normalizeChatModel(modelName);
         if (thinkingLevel) {
             const level = String(thinkingLevel).toLowerCase();
             this.thinkingLevel = ALLOWED_THINKING_LEVELS.has(level) ? level : 'medium';

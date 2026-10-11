@@ -693,8 +693,8 @@ export class ChatRouter {
                 });
                 if (result.success) {
                     this.aiEngine.commitConversationTurn(channel, {
-                        userParts: [{ text: conversationPrompt }],
-                        modelParts: [{ text: reply }]
+                        userParts: [{ type: 'text', text: conversationPrompt }],
+                        modelParts: [{ type: 'text', text: reply }]
                     });
                 }
                 const routeResult = {

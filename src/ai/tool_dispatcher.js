@@ -124,30 +124,30 @@ export class ToolDispatcher {
         if (disableMultimedia) return undefined;
 
         const compiled = [];
-        if (hasWebpageUrls) compiled.push({ urlContext: {} });
-        if (this.#searchMode === 'google') compiled.push({ googleSearch: {} });
+        if (hasWebpageUrls) compiled.push({ type: 'url_context' });
+        if (this.#searchMode === 'google') compiled.push({ type: 'google_search' });
 
         const declarations = this.#compileFunctionDeclarations(caller, channelContext);
         if (declarations.length > 0) {
-            compiled.push({ functionDeclarations: declarations });
+            compiled.push(...declarations);
         }
         return compiled.length > 0 ? compiled : undefined;
     }
 
     hasGoogleSearch(tools) {
         if (!Array.isArray(tools)) return false;
-        return tools.some(t => Boolean(t && (t.googleSearch || t.google_search)));
+        return tools.some(t => t?.type === 'google_search');
     }
 
     withoutFunctionDeclarations(tools) {
         if (!tools?.length) return tools;
-        const filtered = tools.filter(t => !t.functionDeclarations);
+        const filtered = tools.filter(t => t.type !== 'function');
         return filtered.length > 0 ? filtered : undefined;
     }
 
     withoutGoogleSearch(tools) {
         if (!tools?.length) return tools;
-        const filtered = tools.filter(t => !(t && (t.googleSearch || t.google_search)));
+        const filtered = tools.filter(t => t?.type !== 'google_search');
         return filtered.length > 0 ? filtered : undefined;
     }
 
@@ -189,9 +189,10 @@ export class ToolDispatcher {
 
     #toDeclaration(tool) {
         return {
+            type: 'function',
             name: tool.name,
             description: tool.description || '',
-            parametersJsonSchema: tool.parameters || { type: 'object', properties: {} }
+            parameters: tool.parameters || { type: 'object', properties: {} }
         };
     }
 
@@ -203,19 +204,9 @@ export class ToolDispatcher {
     }
 
     #extractFunctionCalls(result) {
-        const parts = result?.candidates?.[0]?.content?.parts || [];
-        const calls = [];
-        for (const part of parts) {
-            const fc = part.functionCall || part.function_call;
-            if (fc && fc.name) {
-                calls.push({
-                    name: fc.name,
-                    args: this.#normalizeArgs(fc.args ?? fc.arguments),
-                    id: fc.id
-                });
-            }
-        }
-        return calls;
+        return (result?.steps || []).filter(step => step.type === 'function_call').map(step => ({
+            name: step.name, args: this.#normalizeArgs(step.arguments), id: step.id
+        }));
     }
 
     #normalizeArgs(args) {
@@ -224,10 +215,6 @@ export class ToolDispatcher {
             try { return JSON.parse(args); } catch { return { raw: args }; }
         }
         return args;
-    }
-
-    #rawParts(result) {
-        return result?.candidates?.[0]?.content?.parts || [];
     }
 
     async executeTurnLoop({
@@ -251,21 +238,13 @@ export class ToolDispatcher {
             // Force text synthesis on the last call of a multi-turn loop.
             if (isLast && turn > 0) {
                 workingContents.push({
-                    role: 'user',
-                    parts: [{ text: TOOL_BUDGET_MESSAGE }]
+                    type: 'user_input',
+                    content: [{ type: 'text', text: TOOL_BUDGET_MESSAGE }]
                 });
             }
 
             result = await invokeModel({ contents: workingContents, tools: turnTools });
             turnCount += 1;
-
-            if (result?.promptFeedback?.blockReason) {
-                return { result, turnCount, workingContents, stopped: 'blocked' };
-            }
-            const finishReason = result?.candidates?.[0]?.finishReason;
-            if (finishReason === 'SAFETY' || finishReason === 'IMAGE_SAFETY') {
-                return { result, turnCount, workingContents, stopped: 'safety' };
-            }
 
             const functionCalls = this.#extractFunctionCalls(result);
             if (functionCalls.length === 0) {
@@ -276,9 +255,9 @@ export class ToolDispatcher {
             }
 
             const responseParts = await this.#dispatchFunctionCalls(functionCalls, context);
-            const fatalPart = responseParts.find((p) => p?.functionResponse?.response?.fatal);
+            const fatalPart = responseParts.find((p) => p?.result?.fatal);
             if (fatalPart) {
-                const response = fatalPart.functionResponse.response;
+                const response = fatalPart.result;
                 return {
                     result,
                     turnCount,
@@ -288,13 +267,9 @@ export class ToolDispatcher {
                 };
             }
 
-            // CRITICAL: push unmodified candidate parts so thought + thoughtSignature
-            // + functionCall survive the next generateContent call.
-            workingContents.push({ role: 'model', parts: this.#rawParts(result) });
-            workingContents.push({
-                role: 'user',
-                parts: responseParts
-            });
+            // Replay the complete timeline unchanged, including opaque thought
+            // signatures and built-in tool steps, before our function results.
+            workingContents.push(...(result.steps || []), ...responseParts);
         }
 
         return { result, turnCount, workingContents, stopped: 'ceiling' };
@@ -397,9 +372,10 @@ export class ToolDispatcher {
     }
 
     #functionResponse(fc, response) {
-        const body = { name: fc.name, response };
-        if (fc.id) body.id = fc.id;
-        return { functionResponse: body };
+        return {
+            type: 'function_result', name: fc.name, call_id: fc.id,
+            result: response, ...(response.error ? { is_error: true } : {})
+        };
     }
 }
 

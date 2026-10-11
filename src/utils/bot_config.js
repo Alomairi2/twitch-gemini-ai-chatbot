@@ -3,6 +3,8 @@
 // Single deep module managing bot configuration: factory presets, schema
 // sanitization, and the non-throwing ConfigStore persistence layer across 6 domains.
 
+import { DEFAULT_CHAT_MODEL, normalizeChatModel } from './chat_models.js';
+
 export const CONFIG_TYPES = Object.freeze([
     'bot_settings',
     'stream_actions',
@@ -15,7 +17,7 @@ export const CONFIG_TYPES = Object.freeze([
 export const FACTORY = Object.freeze({
     bot_settings: Object.freeze({
         channels: Object.freeze([]),
-        model_name: 'gemini-3.8-flash',
+        model_name: DEFAULT_CHAT_MODEL,
         thinking_level: 'medium',
         search_grounding: '',
         tavily_search_depth: 'basic',
@@ -246,7 +248,7 @@ export function createFactoryDefaults(env = {}) {
     return Object.freeze({
         bot_settings: Object.freeze({
             channels: Object.freeze(csvList(env.JOIN_CHANNELS)),
-            model_name: env.MODEL_NAME || FACTORY.bot_settings.model_name,
+            model_name: normalizeChatModel(env.MODEL_NAME),
             thinking_level: env.THINKING_LEVEL || FACTORY.bot_settings.thinking_level,
             search_grounding: env.SEARCH_GROUNDING || FACTORY.bot_settings.search_grounding,
             tavily_search_depth: env.TAVILY_SEARCH_DEPTH || FACTORY.bot_settings.tavily_search_depth,
@@ -435,7 +437,7 @@ export function sanitizeConfig(type, raw, context = {}) {
                     .map((c) => String(c || '').trim().replace(/^#/, '').toLowerCase())
                     .filter(Boolean);
             }
-            if ('model_name' in raw && raw.model_name) out.model_name = String(raw.model_name).trim();
+            if ('model_name' in raw) out.model_name = normalizeChatModel(raw.model_name);
             if ('thinking_level' in raw && raw.thinking_level) out.thinking_level = String(raw.thinking_level).trim();
             if ('search_grounding' in raw) out.search_grounding = String(raw.search_grounding || '').trim();
             if ('tavily_search_depth' in raw) out.tavily_search_depth = String(raw.tavily_search_depth || 'basic').trim();
