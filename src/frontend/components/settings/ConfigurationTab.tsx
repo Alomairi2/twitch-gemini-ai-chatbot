@@ -159,7 +159,7 @@ export default function ConfigurationTab({
         <input type="number" min={0} max={30} value={value.ai_history_length} onChange={(event) => change('ai_history_length', Math.max(0, parseInt(event.target.value, 10) || 0))} className={`w-24 ${inputCls}`} />
       </FieldRow>
       <FieldRow label="Chat context" hint="Recent messages the bot can see">
-        <input type="number" min={1} max={50} value={value.chat_context_length} onChange={(event) => change('chat_context_length', Math.max(1, parseInt(event.target.value, 10) || 10))} className={`w-24 ${inputCls}`} />
+        <input type="number" min={1} max={50} value={value.chat_context_length} onChange={(event) => change('chat_context_length', Math.max(1, parseInt(event.target.value, 10) || 20))} className={`w-24 ${inputCls}`} />
       </FieldRow>
       <FieldRow label="Web search" noBorder={value.search_grounding !== 'tavily'}>
         <select value={value.search_grounding} onChange={(event) => change('search_grounding', event.target.value)} className={selectCls}>

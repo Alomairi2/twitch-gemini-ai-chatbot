@@ -24,7 +24,7 @@ export const FACTORY = Object.freeze({
         cooldown_duration: 0,
         ignored_usernames: Object.freeze(['streamelements', 'nightbot']),
         ai_history_length: 10,
-        chat_context_length: 10,
+        chat_context_length: 20,
         reply_mode: 'off',
         ignore_emote_only_prompts: true,
         enable_emote_appending: true,

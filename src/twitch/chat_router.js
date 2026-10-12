@@ -260,7 +260,7 @@ export class ChatRouter {
         eventAlerts,
         systemInstructions,
         cooldownDuration = 1,
-        chatContextLength = 10,
+        chatContextLength = 20,
         maxMessageLength = 499,
         prefixes = {},
         mediaCommands = null,

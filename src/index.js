@@ -184,7 +184,7 @@ const chatRouter = new ChatRouter({
     customCommands: bootConfig.commands?.custom,
     eventAlerts: bootConfig.event_alerts,
     cooldownDuration: bootConfig.bot_settings?.cooldown_duration !== undefined ? bootConfig.bot_settings.cooldown_duration : (env.COOLDOWN_DURATION !== undefined ? parseInt(env.COOLDOWN_DURATION, 10) : 0),
-    chatContextLength: bootConfig.bot_settings?.chat_context_length !== undefined ? bootConfig.bot_settings.chat_context_length : (parseInt(env.CHAT_CONTEXT_LENGTH, 10) || 10),
+    chatContextLength: bootConfig.bot_settings?.chat_context_length !== undefined ? bootConfig.bot_settings.chat_context_length : (parseInt(env.CHAT_CONTEXT_LENGTH, 10) || 20),
     maxMessageLength: 499,
     replyMode: bootConfig.bot_settings?.reply_mode,
     ignoreEmoteOnlyPrompts: bootConfig.bot_settings?.ignore_emote_only_prompts,
