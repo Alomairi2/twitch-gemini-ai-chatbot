@@ -24,6 +24,7 @@ const EMPTY_VIEW = { tokens: [], match: null, space: null, pool: [] };
 const EMOTE_ONLY = /^(?:\s*emote:\S+\s*)+$/;
 const WORD = '\\p{L}\\p{N}_';
 const URL_SPLIT = /(https?:\/\/\S+)/g;
+const MAX_OBSERVED_TWITCH_EMOTES = 512;
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const channelKey = (channel) => (channel ? `#${String(channel).replace('#', '').toLowerCase()}` : null);
@@ -55,6 +56,22 @@ function createDefaultProviders(fetchImpl) {
   };
 }
 
+export function getEmoteHarness(appendEnabled = false) {
+  const parts = [
+    '<emotes>',
+    'emote:NAME identifies a Twitch emote in conversational text and supplied chat context.',
+    'Treat emote:NAME tokens as opaque unless the user\'s request makes the emote relevant.',
+    'You may reproduce emotes observed in supplied context when relevant or explicitly requested, preserving their exact spelling and case. Do not invent emotes.',
+    'Unmarked emote-like text in previous bot replies does not establish that an emote exists.',
+    'Thought summaries are model-generated reasoning, not emote evidence, even when they contain emote:NAME markers.'
+  ];
+  if (appendEnabled) {
+    parts.push('The application may automatically append a channel emote to your response. You do not choose an automatically appended emote and should not claim to know why a particular emote was selected.');
+  }
+  parts.push('</emotes>');
+  return parts.join('\n');
+}
+
 export class EmotePool {
   #storage;
   #fetch;
@@ -63,6 +80,7 @@ export class EmotePool {
   #providers;
   #cfg;
   #channels = new Map();
+  #nativeNames = new Map();
   #globals = { '7tv': new Map(), bttv: new Map(), ffz: new Map() };
   #setIdToChannel = new Map();
   #twitchIdToChannel = new Map();
@@ -221,6 +239,7 @@ export class EmotePool {
     this.#bttv?.dispose();
     this.#sevenTv = this.#bttv = null;
     this.#listeners.clear();
+    this.#nativeNames.clear();
   }
 
   on(event, listener) {
@@ -248,7 +267,8 @@ export class EmotePool {
     const raw = typeof text === 'string' ? text : '';
     const view = this.#view(channel);
     const emoteIdMap = this.#twitchEmoteIds(raw, tags);
-    const twitchNames = new Set(Object.keys(emoteIdMap));
+    this.#rememberNativeNames(channel, Object.keys(emoteIdMap));
+    const twitchNames = this.#nativeNames.get(channelKey(channel)) || new Set(Object.keys(emoteIdMap));
 
     const textForLogs = this.#flag(view, raw, twitchNames);
     const body = prefix ? raw.slice(prefix.length).replace(/^,\s*/, '').trim() : raw;
@@ -287,21 +307,7 @@ export class EmotePool {
   }
 
   getHarnessInstructions() {
-    const parts = [
-      '<emotes>',
-      'emote:NAME identifies a Twitch emote in supplied context.',
-      'Treat emote:NAME tokens as opaque unless the user\'s request makes the emote relevant.',
-      'You may reproduce emotes observed in supplied context when relevant or explicitly requested, preserving their exact spelling and case. Do not invent emotes.'
-    ];
-
-    if (this.#cfg.appendEnabled) {
-      parts.push(
-        'The application may automatically append a channel emote to your response. You do not choose an automatically appended emote and should not claim to know why a particular emote was selected.'
-      );
-    }
-
-    parts.push('</emotes>');
-    return parts.join('\n');
+    return getEmoteHarness(this.#cfg.appendEnabled);
   }
 
   /**
@@ -312,7 +318,12 @@ export class EmotePool {
    */
   flagText(channel, text) {
     if (text == null || text === '') return text;
-    return this.#flag(this.#view(channel), String(text), new Set());
+    return this.#flag(this.#view(channel), String(text), this.#nativeNames.get(channelKey(channel)) || new Set());
+  }
+
+  /** Prepare completed model text for memory; model-written markers are not evidence. */
+  prepareModelText(channel, text) {
+    return this.flagText(channel, this.decorateReply(channel, text, { appendEmote: false }));
   }
 
   /* ── Internal State & Helpers ────────────────────────────── */
@@ -418,6 +429,7 @@ export class EmotePool {
   }
 
   #dropChannel(key) {
+    this.#nativeNames.delete(key);
     const state = this.#channels.get(key);
     if (!state) return;
     if (state.sevenTvSetId) this.#setIdToChannel.delete(state.sevenTvSetId);
@@ -807,6 +819,20 @@ export class EmotePool {
       if (name) out[name] = String(emoteId);
     }
     return out;
+  }
+
+  // Twitch tags verify native names. Keep bounded, channel-local evidence for
+  // later conversational text; subscriber emotes never enter the append pool.
+  #rememberNativeNames(channel, names) {
+    const key = channelKey(channel);
+    if (!key || names.length === 0) return;
+    let known = this.#nativeNames.get(key);
+    if (!known) this.#nativeNames.set(key, known = new Set());
+    for (const name of names) {
+      known.delete(name);
+      known.add(name);
+      if (known.size > MAX_OBSERVED_TWITCH_EMOTES) known.delete(known.values().next().value);
+    }
   }
 
   #flag(view, text, twitchNames) {

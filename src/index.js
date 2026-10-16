@@ -161,6 +161,7 @@ const aiEngine = new AIEngine({
     maxResponseLength: 450,
     errorHandler,
     imageDownloader,
+    emotePool: emotes,
     tools: helixTools,
     streamActionsPolicy: bootConfig.stream_actions
 });

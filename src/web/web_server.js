@@ -1226,7 +1226,6 @@ export class WebServer {
                 });
                 const framed = `[Event Alert: ${eventKind}] ${interpolated}`;
                 const harness = [
-                    this.#emotePool?.getHarnessInstructions?.() || '',
                     EVENT_REACTION_HARNESS
                 ];
                 const testChan = `__test_alert_${Date.now()}__`;

@@ -403,13 +403,6 @@ export class ChatRouter {
         return { kind: 'none' };
     }
 
-    #buildHarnessInstructions() {
-        const parts = [this.emotePool.getHarnessInstructions()];
-        const mediaHarness = this.mediaPipeline.getHarnessInstructions?.(this.prefixLists);
-        if (mediaHarness) parts.push(mediaHarness);
-        return parts;
-    }
-
     /**
      * Binds inbound chat messages and EventSub events. Returns an unsubscribe function.
      * @param {object} transport TwitchTransport-like collaborator
@@ -480,13 +473,6 @@ export class ChatRouter {
         if (typeof source === 'string') {
             this.#systemInstructions = source;
         }
-    }
-
-    #flaggedPersona(channel) {
-        if (typeof this.emotePool.flagText === 'function') {
-            return this.emotePool.flagText(channel, this.systemInstructions);
-        }
-        return this.systemInstructions || '';
     }
 
     async #deliverResponse(transport, {
@@ -747,8 +733,8 @@ export class ChatRouter {
                     channel,
                     channelContext,
                     recentLogs,
-                    harnessInstructions: this.#buildHarnessInstructions(),
-                    overrideFileContext: this.#flaggedPersona(channel),
+                    harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
+                    overrideFileContext: this.systemInstructions,
                     caller: {
                         loginName: message.loginName,
                         isBroadcaster: !!message.isBroadcaster,
@@ -880,18 +866,14 @@ export class ChatRouter {
                             logCount: this.chatContextLength
                         });
                         const framed = `[Event Alert: ${eventKind}] ${interpolate(promptTemplate, vars)}`;
-                        const flaggedFramed = typeof this.emotePool.flagText === 'function'
-                            ? this.emotePool.flagText(channel, framed)
-                            : framed;
-                        const raw = await this.aiEngine.generate(flaggedFramed, {
+                        const raw = await this.aiEngine.generate(framed, {
                             channel,
                             channelContext,
                             recentLogs,
                             harnessInstructions: [
-                                this.emotePool.getHarnessInstructions(),
                                 EVENT_REACTION_HARNESS
                             ],
-                            overrideFileContext: this.#flaggedPersona(channel),
+                            overrideFileContext: this.systemInstructions,
                             disableTools: true,
                             caller: {
                                 loginName: event.user?.login || '',
@@ -936,18 +918,14 @@ export class ChatRouter {
                         logCount: this.chatContextLength
                     });
                     const framed = `[Event Alert: ${eventKind}] ${interpolate(promptTemplate, vars)}`;
-                    const flaggedFramed = typeof this.emotePool.flagText === 'function'
-                        ? this.emotePool.flagText(channel, framed)
-                        : framed;
-                    const raw = await this.aiEngine.generate(flaggedFramed, {
+                    const raw = await this.aiEngine.generate(framed, {
                         channel,
                         channelContext,
                         recentLogs,
                         harnessInstructions: [
-                            this.emotePool.getHarnessInstructions(),
                             EVENT_REACTION_HARNESS
                         ],
-                        overrideFileContext: this.#flaggedPersona(channel),
+                        overrideFileContext: this.systemInstructions,
                         disableTools: true,
                         caller: {
                             loginName: event.user?.login || '',

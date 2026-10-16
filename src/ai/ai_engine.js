@@ -4,6 +4,7 @@ import { ImageDownloader } from '../utils/image_downloader.js';
 import { ToolDispatcher } from './tool_dispatcher.js';
 import { assertInteractionSucceeded } from './interaction_response.js';
 import { DEFAULT_CHAT_MODEL, normalizeChatModel } from '../utils/chat_models.js';
+import { getEmoteHarness } from '../twitch/emote_pool.js';
 
 const DEFAULT_MODEL_ATTEMPT_TIMEOUT_MS = 35_000;
 const ALLOWED_THINKING_LEVELS = new Set(['low', 'medium', 'high']);
@@ -37,6 +38,7 @@ export class AIEngine {
     #injectedSearchProvider;
     #sleep;
     #random;
+    #emotePool;
 
     constructor({
         googleBackend,
@@ -54,6 +56,7 @@ export class AIEngine {
         maxResponseLength = 450,
         errorHandler = new ErrorHandler(),
         imageDownloader = null,
+        emotePool = null,
         fetchImpl = (...a) => globalThis.fetch(...a),
         clientFactory = (options) => new GoogleGenAI(options),
         modelAttemptTimeoutMs = DEFAULT_MODEL_ATTEMPT_TIMEOUT_MS,
@@ -85,6 +88,7 @@ export class AIEngine {
         this.youtubeApiKey = youtubeApiKey;
         this.maxResponseLength = parseInt(maxResponseLength, 10) || 450;
         this.errorHandler = errorHandler;
+        this.#emotePool = emotePool;
         this.#sleep = sleep;
         this.#random = random;
         this.fetchImpl = fetchImpl;
@@ -177,9 +181,27 @@ export class AIEngine {
         }
 
         this.#checkHistoryLength(channel);
+        this.#rememberConversation(channel, userParts, [{ type: 'model_output', content: modelParts }]);
+    }
+
+    #prepareConversationParts(channel, parts, model = false) {
+        return structuredClone(parts).map(part => part.type === 'text'
+            ? { ...part, text: (model
+                ? this.#emotePool?.prepareModelText(channel, part.text)
+                : this.#emotePool?.flagText(channel, part.text)) ?? part.text }
+            : part);
+    }
+
+    // Normalize completed conversational text only. Whole thought blocks,
+    // including summaries, must replay unchanged across turns; the emote harness
+    // excludes them from evidence. Active tool and length-retry steps stay raw.
+    // https://ai.google.dev/gemini-api/docs/thinking#thought-signatures
+    #rememberConversation(channel, userParts, modelSteps) {
         const history = this.getHistory(channel);
-        history.push({ type: 'user_input', content: structuredClone(userParts) });
-        history.push({ type: 'model_output', content: structuredClone(modelParts) });
+        history.push({ type: 'user_input', content: this.#prepareConversationParts(channel, userParts) });
+        history.push(...modelSteps.map(step => step.type === 'model_output'
+            ? { ...structuredClone(step), content: this.#prepareConversationParts(channel, step.content, true) }
+            : structuredClone(step)));
     }
 
     #checkHistoryLength(channel) {
@@ -203,6 +225,7 @@ export class AIEngine {
      * Compiles trusted behavioral instructions for Gemini's system_instruction wire field.
      */
     #compileSystemInstruction({
+        channel,
         channelContext,
         harnessInstructions,
         overrideFileContext,
@@ -215,7 +238,9 @@ export class AIEngine {
         ];
 
         const systemInstructions = overrideFileContext ?? this.fileContext;
-        if (systemInstructions) sections.push(systemInstructions);
+        if (systemInstructions) sections.push(this.#emotePool?.flagText(channel, systemInstructions) ?? systemInstructions);
+
+        sections.push(this.#emotePool?.getHarnessInstructions() ?? getEmoteHarness());
 
         const harness = this.#normalizeHarness(harnessInstructions);
         if (harness) sections.push(harness);
@@ -583,7 +608,7 @@ export class AIEngine {
         const steps = result?.steps || [];
         const output = steps.findLast(step => step.type === 'model_output');
         const text = (output?.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('');
-        // Only the final conversational output and its thought signatures enter
+        // Only the final conversational output and complete thought blocks enter
         // memory. Tool results and built-in grounding steps remain turn-local.
         const memorySteps = text.trim()
             ? steps.filter(step => step.type === 'thought' || step === output).map(step => step === output
@@ -656,6 +681,7 @@ export class AIEngine {
         started,
         trace
     }) {
+        prompt = this.#emotePool?.flagText(channel, prompt) ?? prompt;
         this.#logHeader('GEMINI REQUEST');
         console.log(`   ${COLORS.dim}Model:${COLORS.reset} ${this.modelName} ${COLORS.dim}│ Grounding:${COLORS.reset} ${this.searchGrounding} ${COLORS.dim}│ Thinking:${COLORS.reset} ${this.thinkingLevel}`);
         console.log(`   ${COLORS.dim}Input:${COLORS.reset} ${prompt}`);
@@ -684,6 +710,7 @@ export class AIEngine {
         const tools = this.#selectTools({ allUrls, imageUrl, disableMultimedia, disableTools, caller, channelContext });
 
         const systemInstruction = this.#compileSystemInstruction({
+            channel,
             channelContext,
             harnessInstructions,
             overrideFileContext,
@@ -714,6 +741,7 @@ export class AIEngine {
         const disableGoogleGrounding = async () => {
             activeTools = this.#toolDispatcher.withoutGoogleSearch(activeTools);
             activeSystemInstruction = this.#compileSystemInstruction({
+                channel,
                 channelContext,
                 harnessInstructions,
                 overrideFileContext,
@@ -833,8 +861,7 @@ export class AIEngine {
         this.#logFooter();
 
         if (recordMemory) {
-            history.push({ type: 'user_input', content: memoryUserParts });
-            history.push(...latestSuccessfulSteps);
+            this.#rememberConversation(channel, memoryUserParts, latestSuccessfulSteps);
         }
 
         return agentResponse;
