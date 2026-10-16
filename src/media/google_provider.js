@@ -409,7 +409,8 @@ export class GoogleProvider {
                 : input.prompt;
             const kind = type === 'image' ? 'image' : type === 'video' ? 'video' : 'audio';
             const request = { model: target.model, input: interactionInput, store: false };
-            request.response_format = { type: kind };
+            // Let Lyria choose its audio defaults; a partial format fails Vertex bit-rate validation.
+            if (type !== 'music') request.response_format = { type: kind };
             if (type === 'tts') {
                 request.generation_config = { speech_config: [{ voice: target.voice || 'Kore' }] };
                 request.response_format.mime_type = 'audio/wav';
