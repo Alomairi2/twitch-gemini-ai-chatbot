@@ -5,8 +5,53 @@ import { FACTORY, commandsToMap } from '../utils/bot_config.js';
 import { NOOP_EXECUTION_TRACE } from '../utils/execution_trace.js';
 import { EVENT_REACTION_HARNESS } from './event_reaction.js';
 
+async function generateGroqResponse(prompt) {
+const apiKey = process.env.GROQ_API_KEY;
+
+```
+if (!apiKey) {
+    throw new Error('GROQ_API_KEY is missing');
+}
+
+const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+            {
+                role: 'system',
+                content: 'You are a helpful Twitch chat assistant. Reply in a concise, friendly way. Keep answers short enough for Twitch chat.'
+            },
+            {
+                role: 'user',
+                content: prompt
+            }
+        ],
+        max_tokens: 120,
+        temperature: 0.7
+    }),
+    signal: AbortSignal.timeout(15000)
+});
+
+if (!response.ok) {
+    const details = await response.text();
+    console.error('[Groq] API error:', response.status, details);
+    throw new Error(`Groq API request failed: ${response.status}`);
+}
+
+const data = await response.json();
+return data.choices?.[0]?.message?.content?.trim()
+    || 'ما قدرت أطلع لك إجابة الحين، جرّب مرة ثانية.';
+```
+
+}
+
 const DEFAULT_PREFIXES = {
-    ai: ['!gemini', '@yourbotusername'],
+    ai: ['!gemini', '!ai', '@yourbotusername'],
     image: ['!image'],
     video: ['!video'],
     tts: ['!tts'],
@@ -729,7 +774,26 @@ export class ChatRouter {
                     logCount: this.chatContextLength
                 });
                 const prompt = frameConversationalMessage(message, textForAi);
-                const rawResponse = await this.aiEngine.generate(prompt, {
+                let rawResponse;
+
+if (aiCommand === '!ai') {
+rawResponse = await generateGroqResponse(prompt);
+} else {
+rawResponse = await this.aiEngine.generate(prompt, {
+channel,
+channelContext,
+recentLogs,
+harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
+overrideFileContext: this.systemInstructions,
+caller: {
+loginName: message.loginName,
+isBroadcaster: !!message.isBroadcaster,
+isMod: !!message.isMod
+},
+trace
+});
+}
+
                     channel,
                     channelContext,
                     recentLogs,
