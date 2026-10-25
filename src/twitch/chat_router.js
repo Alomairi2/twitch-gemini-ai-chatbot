@@ -8,7 +8,6 @@ import { EVENT_REACTION_HARNESS } from './event_reaction.js';
 async function generateGroqResponse(prompt) {
 const apiKey = process.env.GROQ_API_KEY;
 
-```
 if (!apiKey) {
     throw new Error('GROQ_API_KEY is missing');
 }
@@ -46,7 +45,6 @@ if (!response.ok) {
 const data = await response.json();
 return data.choices?.[0]?.message?.content?.trim()
     || 'ما قدرت أطلع لك إجابة الحين، جرّب مرة ثانية.';
-```
 
 }
 
