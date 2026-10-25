@@ -772,38 +772,28 @@ export class ChatRouter {
                     logCount: this.chatContextLength
                 });
                 const prompt = frameConversationalMessage(message, textForAi);
-                let rawResponse;
+                
 
-if (aiCommand === '!ai') {
-rawResponse = await generateGroqResponse(prompt);
-} else {
-rawResponse = await this.aiEngine.generate(prompt, {
-channel,
-channelContext,
-recentLogs,
-harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
-overrideFileContext: this.systemInstructions,
-caller: {
-loginName: message.loginName,
-isBroadcaster: !!message.isBroadcaster,
-isMod: !!message.isMod
-},
-trace
-});
-}
+                                let rawResponse;
 
-                    channel,
-                    channelContext,
-                    recentLogs,
-                    harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
-                    overrideFileContext: this.systemInstructions,
-                    caller: {
-                        loginName: message.loginName,
-                        isBroadcaster: !!message.isBroadcaster,
-                        isMod: !!message.isMod
-                    },
-                    trace
-                });
+                if (aiCommand === '!ai') {
+                    rawResponse = await generateGroqResponse(prompt);
+                } else {
+                    rawResponse = await this.aiEngine.generate(prompt, {
+                        channel,
+                        channelContext,
+                        recentLogs,
+                        harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
+                        overrideFileContext: this.systemInstructions,
+                        caller: {
+                            loginName: message.loginName,
+                            isBroadcaster: !!message.isBroadcaster,
+                            isMod: !!message.isMod
+                        },
+                        trace
+                    });
+                }
+
                 const reply = await this.#deliverResponse(transport, {
                     channel,
                     text: rawResponse,
@@ -811,7 +801,14 @@ trace
                     decorateAi: true,
                     trace
                 });
-                return finish({ kind: 'ai', channel, command: aiCommand, sent: true, reply });
+
+                return finish({
+                    kind: 'ai',
+                    channel,
+                    command: aiCommand,
+                    sent: true,
+                    reply
+                });
             }
 
             trace.markRejected('recognized route did not dispatch');
