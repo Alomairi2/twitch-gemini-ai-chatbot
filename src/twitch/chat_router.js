@@ -5,11 +5,22 @@ import { FACTORY, commandsToMap } from '../utils/bot_config.js';
 import { NOOP_EXECUTION_TRACE } from '../utils/execution_trace.js';
 import { EVENT_REACTION_HARNESS } from './event_reaction.js';
 
-async function generateGroqResponse(prompt) {
-const apiKey = process.env.GROQ_API_KEY;
+async function generateGroqResponse(prompt, systemInstructions) {
+    const apiKey = process.env.GROQ_API_KEY;
 
-if (!apiKey) {
-    throw new Error('GROQ_API_KEY is missing');
+    if (!apiKey) {
+        throw new Error('GROQ_API_KEY is missing');
+    }
+
+    const systemPrompt = [
+        systemInstructions,
+        'اتبع شخصية ruum_ai الأصلية وتعليماتها.',
+        'تكلم باللهجة النجدية السعودية، واستخدم الطقطقة والردود القصيرة حسب السياق.',
+        'تجنب الأسلوب الرسمي وأسلوب خدمة العملاء.'
+    ].filter(Boolean).join('\n\n');
+
+    // بقية طلب Groq تبقى كما هي،
+    // مع استخدام systemPrompt في رسالة system.
 }
 
 const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -21,15 +32,12 @@ const response = await fetch('https://api.groq.com/openai/v1/chat/completions', 
     body: JSON.stringify({
         model: 'openai/gpt-oss-120b',
         messages: [
-            {
-                role: 'system',
-                content: 'You are a helpful Twitch chat assistant. Reply in a concise, friendly way. Keep answers short enough for Twitch chat.'
-            },
-            {
-                role: 'user',
-                content: prompt
-            }
-        ],
+{
+    role: 'system',
+    content: systemPrompt
+}
+
+},
         max_tokens: 120,
         temperature: 0.7
     }),
@@ -777,7 +785,10 @@ export class ChatRouter {
                                 let rawResponse;
 
                 if (aiCommand === '!ai') {
-                    rawResponse = await generateGroqResponse(prompt);
+                    rawResponse = await generateGroqResponse(
+    prompt,
+    this.systemInstructions
+);
                 } else {
                     rawResponse = await this.aiEngine.generate(prompt, {
                         channel,
