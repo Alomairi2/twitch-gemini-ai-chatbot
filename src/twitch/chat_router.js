@@ -78,7 +78,6 @@ async function generateGroqResponse(prompt, systemInstructions = '') {
     return data.choices?.[0]?.message?.content?.trim()
         || 'ياخي مخي علّق شوي، جرّب مرة ثانية 😂';
 }
-وعدّل استدعاء الدالة داخل شرط `!ai` إلى:
 if (aiCommand === '!ai') {
     rawResponse = await generateGroqResponse(
         prompt,
