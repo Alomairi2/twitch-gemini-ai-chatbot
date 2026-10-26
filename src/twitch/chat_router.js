@@ -78,7 +78,7 @@ async function generateGroqResponse(prompt, systemInstructions = '') {
     return data.choices?.[0]?.message?.content?.trim()
         || 'ياخي مخي علّق شوي، جرّب مرة ثانية 😂';
 }
-if (aiCommand === '!ai') {
+    if (aiCommand === '!ai') {
     rawResponse = await generateGroqResponse(
         prompt,
         this.systemInstructions
@@ -97,13 +97,6 @@ if (aiCommand === '!ai') {
         },
         trace
     });
-}
-
-if (!response.ok) {
-    const details = await response.text();
-    console.error('[Groq] API error:', response.status, details);
-    throw new Error(`Groq API request failed: ${response.status}`);
-}
 }
 
 const DEFAULT_PREFIXES = {
