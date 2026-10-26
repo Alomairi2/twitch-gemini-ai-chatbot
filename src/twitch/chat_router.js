@@ -98,25 +98,6 @@ if (aiCommand === '!ai') {
         trace
     });
 }
-    method: 'POST',
-    headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        messages: [
-{
-    role: 'system',
-    content: systemPrompt
-}
-
-},
-        max_tokens: 120,
-        temperature: 0.7
-    }),
-    signal: AbortSignal.timeout(15000)
-});
 
 if (!response.ok) {
     const details = await response.text();
