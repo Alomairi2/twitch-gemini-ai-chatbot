@@ -4,6 +4,7 @@
 import { FACTORY, commandsToMap } from '../utils/bot_config.js';
 import { NOOP_EXECUTION_TRACE } from '../utils/execution_trace.js';
 import { EVENT_REACTION_HARNESS } from './event_reaction.js';
+
 async function generateGroqResponse(prompt, systemInstructions = '') {
     const apiKey = process.env.GROQ_API_KEY;
 
@@ -98,7 +99,6 @@ if (aiCommand === '!ai') {
         trace
     });
 }
-const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
         'Authorization': `Bearer ${apiKey}`,
