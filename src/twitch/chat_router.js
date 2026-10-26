@@ -78,7 +78,9 @@ async function generateGroqResponse(prompt, systemInstructions = '') {
     return data.choices?.[0]?.message?.content?.trim()
         || 'ياخي مخي علّق شوي، جرّب مرة ثانية 😂';
 }
-    if (aiCommand === '!ai') {
+ let rawResponse;
+
+if (aiCommand === '!ai') {
     rawResponse = await generateGroqResponse(
         prompt,
         this.systemInstructions
@@ -98,7 +100,6 @@ async function generateGroqResponse(prompt, systemInstructions = '') {
         trace
     });
 }
-
 const DEFAULT_PREFIXES = {
     ai: ['!gemini', '!ai', '@yourbotusername'],
     image: ['!image'],
@@ -825,29 +826,28 @@ export class ChatRouter {
                 const prompt = frameConversationalMessage(message, textForAi);
                 
 
-                                let rawResponse;
+                               let rawResponse;
 
-                if (aiCommand === '!ai') {
-                    rawResponse = await generateGroqResponse(
-    prompt,
-    this.systemInstructions
-);
-                } else {
-                    rawResponse = await this.aiEngine.generate(prompt, {
-                        channel,
-                        channelContext,
-                        recentLogs,
-                        harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
-                        overrideFileContext: this.systemInstructions,
-                        caller: {
-                            loginName: message.loginName,
-                            isBroadcaster: !!message.isBroadcaster,
-                            isMod: !!message.isMod
-                        },
-                        trace
-                    });
-                }
-
+if (aiCommand === '!ai') {
+    rawResponse = await generateGroqResponse(
+        prompt,
+        this.systemInstructions
+    );
+} else {
+    rawResponse = await this.aiEngine.generate(prompt, {
+        channel,
+        channelContext,
+        recentLogs,
+        harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
+        overrideFileContext: this.systemInstructions,
+        caller: {
+            loginName: message.loginName,
+            isBroadcaster: !!message.isBroadcaster,
+            isMod: !!message.isMod
+        },
+        trace
+    });
+}
                 const reply = await this.#deliverResponse(transport, {
                     channel,
                     text: rawResponse,
