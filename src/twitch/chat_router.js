@@ -4,8 +4,7 @@
 import { FACTORY, commandsToMap } from '../utils/bot_config.js';
 import { NOOP_EXECUTION_TRACE } from '../utils/execution_trace.js';
 import { EVENT_REACTION_HARNESS } from './event_reaction.js';
-
-async function generateGroqResponse(prompt, systemInstructions) {
+async function generateGroqResponse(prompt, systemInstructions = '') {
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
@@ -14,15 +13,91 @@ async function generateGroqResponse(prompt, systemInstructions) {
 
     const systemPrompt = [
         systemInstructions,
-        'اتبع شخصية ruum_ai الأصلية وتعليماتها.',
-        'تكلم باللهجة النجدية السعودية، واستخدم الطقطقة والردود القصيرة حسب السياق.',
-        'تجنب الأسلوب الرسمي وأسلوب خدمة العملاء.'
+        `أنت ruum_ai، بوت تويتش سعودي بشخصية مرحة وواثقة ومزوحه.
+
+تحدث باللهجة السعودية النجدية، وبالأخص لهجة الرياض، واستخدم تعابير سعودية طبيعية.
+
+شخصيتك:
+- خفيف دم، تحب الطقطقة والمزح والردود الباردة المضحكة.
+- عندك ثقة بنفسك وترد بطريقة ذكية ومضحكة.
+- تقدر تطقطق على المشاهدين بشكل ودي إذا كان السياق يسمح، بدون تجريح حقيقي.
+- لا تتكلم بأسلوب رسمي أو كأنك موظف خدمة عملاء.
+- لا تستخدم الفصحى إلا إذا احتاج الموضوع ذلك.
+- لا تكثر الإيموجيات ولا تكرر نفس النكتة باستمرار.
+
+طريقة الرد:
+- خل ردودك قصيرة وطبيعية، غالباً جملة أو جملتين.
+- لا ترد على كل رسالة في الشات؛ رد عندما يكون فيه سؤال أو كلام يستحق الرد.
+- إذا أحد ناداك أو سألك مباشرة، حاول تجاوبه.
+- إذا السؤال جدي، أعط إجابة مفيدة وصحيحة مع المحافظة على شخصيتك.
+- إذا ما تعرف الإجابة، قل ذلك بصراحة ولا تخترع معلومات.
+- لا تشرح أنك ذكاء اصطناعي إلا إذا انطلب منك.
+- لا تكرر كلام المستخدم بدون فائدة.
+- لا تستخدم عبارات افتتاحية رسمية مثل: "بالطبع، يسعدني مساعدتك".
+- اجعل ردودك مناسبة لشات تويتش، مختصرة وعفوية.
+
+أنت ruum_ai، مو مساعد رسمي. خل كلامك طبيعي كأنك واحد من الشباب في البث.`
     ].filter(Boolean).join('\n\n');
 
-    // بقية طلب Groq تبقى كما هي،
-    // مع استخدام systemPrompt في رسالة system.
-}
+    const response = await fetch(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'openai/gpt-oss-120b',
+                messages: [
+                    {
+                        role: 'system',
+                        content: systemPrompt
+                    },
+                    {
+                        role: 'user',
+                        content: prompt
+                    }
+                ],
+                max_tokens: 120,
+                temperature: 0.85
+            }),
+            signal: AbortSignal.timeout(15000)
+        }
+    );
 
+    if (!response.ok) {
+        const details = await response.text();
+        console.error('[Groq] API error:', response.status, details);
+        throw new Error(`Groq API request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    return data.choices?.[0]?.message?.content?.trim()
+        || 'ياخي مخي علّق شوي، جرّب مرة ثانية 😂';
+}
+وعدّل استدعاء الدالة داخل شرط `!ai` إلى:
+if (aiCommand === '!ai') {
+    rawResponse = await generateGroqResponse(
+        prompt,
+        this.systemInstructions
+    );
+} else {
+    rawResponse = await this.aiEngine.generate(prompt, {
+        channel,
+        channelContext,
+        recentLogs,
+        harnessInstructions: this.mediaPipeline.getHarnessInstructions?.(this.prefixLists),
+        overrideFileContext: this.systemInstructions,
+        caller: {
+            loginName: message.loginName,
+            isBroadcaster: !!message.isBroadcaster,
+            isMod: !!message.isMod
+        },
+        trace
+    });
+}
 const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -49,11 +124,6 @@ if (!response.ok) {
     console.error('[Groq] API error:', response.status, details);
     throw new Error(`Groq API request failed: ${response.status}`);
 }
-
-const data = await response.json();
-return data.choices?.[0]?.message?.content?.trim()
-    || 'ما قدرت أطلع لك إجابة الحين، جرّب مرة ثانية.';
-
 }
 
 const DEFAULT_PREFIXES = {
