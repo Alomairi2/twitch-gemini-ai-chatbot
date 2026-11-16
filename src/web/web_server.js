@@ -1008,8 +1008,8 @@ export class WebServer {
                                 ],
                                 temperature: 0.6,
                                 max_completion_tokens: 180,
-                                reasoning_effort: 'low',
-                                reasoning_format: 'hidden'
+                               reasoning_effort: 'low',
+                               include_reasoning: false
                             }),
                             signal: controller.signal
                         }
