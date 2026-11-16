@@ -110,7 +110,12 @@ export class WebServer {
     #keepAliveIntervalMs;
     #heartbeatIntervalMs;
     #fetchImpl;
-    #host;
+    // Nightbot AI - Groq
+    #groqApiKey;
+    #groqModel;
+    #nightbotApiToken;
+    #nightbotUserRequests = new Map();
+     #host;
     #preferredPort;
     #publicDir;
     #distDir;
@@ -169,9 +174,14 @@ export class WebServer {
             publicMediaOrigins = [],
             publicDir = DEFAULT_PUBLIC_DIR,
             distDir = DEFAULT_DIST_DIR,
-            trustProxy = 1,
-            fetchImpl = globalThis.fetch.bind(globalThis),
-            isDevMock = false
+           trustProxy = 1,
+           fetchImpl = globalThis.fetch.bind(globalThis),
+
+        groqApiKey = '',
+        groqModel = 'openai/gpt-oss-20b',
+        nightbotApiToken = '',
+
+        isDevMock = false
         } = options;
 
         if (!transport) throw new Error('WebServer requires transport');
@@ -200,6 +210,11 @@ export class WebServer {
         this.#maxWsPerIp = Math.max(1, Number(maxWsPerIp) || DEFAULT_WS_PER_IP);
         this.#maxWsGlobal = Math.max(1, Number(maxWsGlobal) || DEFAULT_WS_GLOBAL);
         this.#fetchImpl = fetchImpl;
+        
+        this.#groqApiKey = String(groqApiKey || '').trim();
+        this.#groqModel = String(groqModel || 'openai/gpt-oss-20b').trim();
+        this.#nightbotApiToken = String(nightbotApiToken || '').trim();
+        
         this.#host = host;
         this.#preferredPort = port ?? 3000;
         this.#publicDir = publicDir;
@@ -895,7 +910,149 @@ export class WebServer {
         this.#app.head('/healthz', (_req, res) => {
             res.status(204).end();
         });
+        
+        // Nightbot AI endpoint powered by Groq
+        this.#app.get('/api/nightbot-ai', async (req, res) => {
+            res.type('text/plain');
+            res.set('Cache-Control', 'no-store');
 
+            const send = (message) => res.status(200).send(message);
+
+            try {
+                if (!this.#groqApiKey || !this.#nightbotApiToken) {
+                    return send('AI is not configured.');
+                }
+
+                const suppliedToken = String(req.query.token || '');
+                const expectedToken = this.#nightbotApiToken;
+
+                const supplied = Buffer.from(suppliedToken);
+                const expected = Buffer.from(expectedToken);
+
+                if (
+                    supplied.length !== expected.length ||
+                    !crypto.timingSafeEqual(supplied, expected)
+                ) {
+                    return send('Invalid access token.');
+                }
+
+                const question = String(req.query.q || '').trim();
+
+                if (!question) {
+                    return send('اكتب سؤالك بعد !ai');
+                }
+
+                if (question.length > 500) {
+                    return send('سؤالك طويل، اختصره شوي.');
+                }
+
+                const nightbotUser = new URLSearchParams(
+                    req.get('Nightbot-User') || ''
+                ).get('name');
+
+                const username = String(
+                    nightbotUser || req.ip || 'viewer'
+                ).toLowerCase();
+
+                const now = Date.now();
+                const lastRequest = this.#nightbotUserRequests.get(username) || 0;
+
+                if (now - lastRequest < 10000) {
+                    return send('انتظر شوي قبل تسأل مرة ثانية.');
+                }
+
+                this.#nightbotUserRequests.set(username, now);
+
+                if (this.#nightbotUserRequests.size > 1000) {
+                    for (const [user, time] of this.#nightbotUserRequests) {
+                        if (now - time > 60000) {
+                            this.#nightbotUserRequests.delete(user);
+                        }
+                    }
+                }
+
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 20000);
+
+                let response;
+
+                try {
+                    response = await this.#fetchImpl(
+                        'https://api.groq.com/openai/v1/chat/completions',
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${this.#groqApiKey}`,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                model: this.#groqModel,
+                                messages: [
+                                    {
+                                        role: 'system',
+                                        content: [
+                                            'You are a smart, funny Twitch chatbot.',
+                                            'Speak in natural Saudi Gulf Arabic when the user writes Arabic.',
+                                            'Use English when the user writes English.',
+                                            'Be witty, playful and occasionally sarcastic.',
+                                            'Answer serious questions accurately and clearly.',
+                                            'Never invent facts. Say when you are unsure.',
+                                            'Keep every answer short, ideally one sentence.',
+                                            'Do not use Markdown, emojis excessively, or line breaks.'
+                                        ].join(' ')
+                                    },
+                                    {
+                                        role: 'user',
+                                        content: question
+                                    }
+                                ],
+                                temperature: 0.6,
+                                max_completion_tokens: 180,
+                                reasoning_effort: 'low',
+                                reasoning_format: 'hidden'
+                            }),
+                            signal: controller.signal
+                        }
+                    );
+                } finally {
+                    clearTimeout(timeout);
+                }
+
+                if (!response.ok) {
+                    console.error('[Nightbot AI] Groq error:', response.status);
+                    return send(
+                        response.status === 429
+                            ? 'وايد تسال اهدا شوي وخلاص مب راد عليك.'
+                            : 'قاعد اكل الحين ويت.'
+                    );
+                }
+
+                const data = await response.json();
+
+                let answer = data.choices?.[0]?.message?.content || '';
+
+                answer = String(answer)
+                    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+                    .replace(/[\r\n]+/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                if (!answer) {
+                    return send('ماعندي رد ماحبيت السؤال، جرب مرة ثانية.');
+                }
+
+                return send(answer.slice(0, 350));
+
+            } catch (error) {
+                console.error('[Nightbot AI] Request failed:', error.message);
+
+                return send(
+                    error.name === 'AbortError'
+                        ? 'وايد تسال اهدا شوي وخلاص مب راد عليك.'
+                        : 'قاعد اكل الحين ويت.'
+                );
+            }
+        });
         this.#app.get('/healthz', (_req, res) => {
             res.type('text/plain').set('Cache-Control', 'no-store').send('OK');
         });
