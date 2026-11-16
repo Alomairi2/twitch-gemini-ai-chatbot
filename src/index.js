@@ -214,6 +214,9 @@ const server = new WebServer({
     botUsername: env.TWITCH_USERNAME || '',
     externalUrl: env.RENDER_EXTERNAL_URL || '',
     publicMediaOrigins: mediaHostConfig.publicOrigins,
+    groqApiKey: env.GROQ_API_KEY,
+    groqModel: 'openai/gpt-oss-20b',
+    nightbotApiToken: env.NIGHTBOT_API_TOKEN,
     trustProxy: 1
 });
 
